@@ -747,7 +747,16 @@ ticker:SetScript("OnUpdate", function(_, delta)
         elapsed = 0
         BrewmasterProTickerCount = (BrewmasterProTickerCount or 0) + 1
         if IsPlayerInWorld() then
-            UpdateBar()
+            -- WHY: pcall surfaces silent UpdateBar errors when /console scriptErrors 0
+            -- is set (the common default). BrewmasterProLastError / ErrorCount let
+            -- /brewdbg point straight at the failing line.
+            local ok, err = pcall(UpdateBar)
+            if ok then
+                BrewmasterProSuccessCount = (BrewmasterProSuccessCount or 0) + 1
+            else
+                BrewmasterProErrorCount = (BrewmasterProErrorCount or 0) + 1
+                BrewmasterProLastError = err
+            end
         end
     end
 end)
@@ -854,6 +863,12 @@ SlashCmdList["BREWMASTERPRODBG"] = function()
         tostring(testMode), tostring(testStaggerValue)))
     print(string.format("  Last UpdateBar stagger: %s", tostring(BrewmasterProLastStagger)))
     print(string.format("  Last UpdateBar text: %s", tostring(BrewmasterProLastText)))
+    print(string.format("  UpdateBar success/error: %s / %s",
+        tostring(BrewmasterProSuccessCount or 0),
+        tostring(BrewmasterProErrorCount or 0)))
+    if BrewmasterProLastError then
+        print(string.format("  |cffff5555Last error:|r %s", tostring(BrewmasterProLastError)))
+    end
 end
 
 SlashCmdList["BREWMASTERPRO"] = function(msg)
