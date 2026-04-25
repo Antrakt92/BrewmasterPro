@@ -695,15 +695,20 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 end)
 
 -- OnUpdate
+-- WHY: ticker is parented to UIParent (always shown), not the main bar frame.
+-- The bar can be hidden by hideOOC / hideZeroStagger / non-Brewmaster checks,
+-- and a hidden frame's OnUpdate stops firing entirely — which means UpdateBar
+-- only ran when an event happened to fire (UNIT_HEALTH on damage). With this
+-- separate ticker, UpdateBar runs at a steady ~20 Hz no matter what state the
+-- bar is in, so the displayed values stay live throughout combat and decay.
+local ticker = CreateFrame("Frame", nil, UIParent)
 local elapsed = 0
-frame:SetScript("OnUpdate", function(self, delta)
+ticker:SetScript("OnUpdate", function(_, delta)
     elapsed = elapsed + delta
     if elapsed >= 0.05 then
         elapsed = 0
-        if self:IsShown() then
-            if IsPlayerInWorld() then
-                UpdateBar()
-            end
+        if IsPlayerInWorld() then
+            UpdateBar()
         end
     end
 end)
