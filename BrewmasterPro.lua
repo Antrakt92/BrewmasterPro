@@ -204,7 +204,7 @@ frame:SetScript("OnEnter", function(self)
         GameTooltip:AddLine(" ")
         GameTooltip:AddLine("Drag to move", 0.55, 0.85, 0.62)
     end
-    GameTooltip:AddLine("/bm for options", 0.5, 0.6, 0.55)
+    GameTooltip:AddLine("/brew for options", 0.5, 0.6, 0.55)
     GameTooltip:Show()
 end)
 
@@ -767,7 +767,7 @@ end
 -- ============================================================================
 -- Slash command
 -- ============================================================================
-SLASH_BREWMASTERPRO1 = "/bm"
+SLASH_BREWMASTERPRO1 = "/brew"
 SLASH_BREWMASTERPRO2 = "/brewmasterpro"
 
 SlashCmdList["BREWMASTERPRO"] = function(msg)
@@ -790,8 +790,8 @@ SlashCmdList["BREWMASTERPRO"] = function(msg)
         BMP_TryPlaySelectedSound()
 
     else
-        print("|cff00ff00" .. (title or addonName) .. ":|r /bm to open options (or /bm sound to test)")
+        print("|cff00ff00" .. (title or addonName) .. ":|r /brew to open options (or /brew sound to test)")
     end
 end
 
-print(string.format("|cff00ff00%s v%s|r loaded - /bm for options", title or addonName, version or "?"))
+print(string.format("|cff00ff00%s v%s|r loaded - /brew for options", title or addonName, version or "?"))

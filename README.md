@@ -32,8 +32,8 @@ bar that reacts to the moment-to-moment decisions of the spec.
 
 ## Slash commands
 
-- `/bm` or `/brewmasterpro` — open / close the options window
-- `/bm sound` — preview the currently selected alert sound
+- `/brew` or `/brewmasterpro` — open / close the options window
+- `/brew sound` — preview the currently selected alert sound
 
 ## Installation
 
