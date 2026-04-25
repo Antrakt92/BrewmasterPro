@@ -477,18 +477,31 @@ GetStaggerAmount = function()
     return s or 0
 end
 
--- WHY: C_Spell.GetSpellCharges returns "secret number values" for
--- currentCharges (not readable even via tostring round-trip), but
--- isActive is plain boolean and maxCharges/cooldownStartTime/Duration
--- *are* recoverable via tostring->tonumber. We infer current charges
--- from isActive + IsUsableSpell instead of reading currentCharges:
---   isActive=false                 -> full charges (current = max)
---   isActive=true, IsUsableSpell=1 -> 1 charge ready, 1 recharging
---   isActive=true, IsUsableSpell=0 -> 0 charges (all gone)
--- All secret-suspect access lives inside pcall so any taint dies
--- at the boundary and UpdateBar always completes.
+-- WHY: tracks PB charges across casts when API can't give us a plain count.
+-- We watch SPELL_UPDATE_CHARGES + UNIT_SPELLCAST_SUCCEEDED to maintain
+-- a local counter that decrements on cast and restores when recharge
+-- timer reaches zero.
+local pbTrackedCurrent = nil
+local pbTrackedNextRecharge = 0
+
+-- WHY: C_Spell.GetSpellCharges' currentCharges is a "secret number value"
+-- that can't even be read via tostring (returns "<no value>"-equivalent).
+-- IsSpellUsable doesn't help for PB because it has no resource cost (always
+-- returns true even at 0 charges). GetSpellCount is the long-standing
+-- fallback that returns a plain integer for charged spells. If it works,
+-- we use it directly; otherwise we fall back to event-based tracking.
+-- All secret-suspect access lives inside pcall so taint dies at the boundary.
 GetPurifyingBrewState = function()
-    local current, max, remaining = 0, 2, nil  -- 2 is PB's known maxCharges
+    local max, remaining = 2, nil  -- 2 is PB's known maxCharges
+    local current
+
+    -- Primary: GetSpellCount usually returns a plain integer count.
+    if GetSpellCount then
+        local c = GetSpellCount(SPELL_PURIFYING_BREW)
+        if type(c) == "number" and c >= 0 and c <= 10 then
+            current = c
+        end
+    end
 
     local cs = C_Spell and C_Spell.GetSpellCharges
     if cs then
@@ -496,28 +509,24 @@ GetPurifyingBrewState = function()
             local info = cs(SPELL_PURIFYING_BREW)
             if not info then return end
 
-            -- maxCharges is plain in current API; still tostring-trip for safety.
             local mx = tonumber(tostring(info.maxCharges or "")) or 2
             max = mx
 
-            -- isActive is a plain boolean — directly readable.
             local isActive = info.isActive and true or false
 
-            if not isActive then
-                current = mx
-            else
-                -- Spell is on (some) cooldown; check usability for finer state.
-                local usable
-                if C_Spell and C_Spell.IsSpellUsable then
-                    usable = C_Spell.IsSpellUsable(SPELL_PURIFYING_BREW)
-                elseif IsUsableSpell then
-                    usable = IsUsableSpell(SPELL_PURIFYING_BREW)
+            -- If GetSpellCount didn't give us a plain count, derive from
+            -- the locally-tracked counter or fall back to the safest guess.
+            if current == nil then
+                if not isActive then
+                    current = mx  -- no cooldown → full charges
+                elseif pbTrackedCurrent ~= nil then
+                    current = pbTrackedCurrent
+                else
+                    current = 0  -- safe pessimistic default
                 end
-                current = usable and (mx - 1) or 0
             end
 
-            -- Cooldown timer: cooldownStartTime/Duration ARE recoverable via
-            -- tostring round-trip (unlike currentCharges).
+            -- Recharge timer (these fields ARE recoverable via tostring).
             local st = tonumber(tostring(info.cooldownStartTime or "")) or 0
             local du = tonumber(tostring(info.cooldownDuration or "")) or 0
             if isActive and st > 0 and du > 0 then
@@ -526,6 +535,7 @@ GetPurifyingBrewState = function()
                 remaining = r
             end
         end)
+        if current == nil then current = 0 end
         return current, max, remaining
     end
 
@@ -719,8 +729,11 @@ frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 -- SPELL_UPDATE_COOLDOWN fires for every spell — too noisy. The 20Hz OnUpdate
 -- below smoothly ticks the recharge timer between charge events.
 frame:RegisterEvent("SPELL_UPDATE_CHARGES")
+-- WHY: needed for the event-driven charge counter fallback when the API
+-- only gives us secret values for currentCharges.
+frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 
-frame:SetScript("OnEvent", function(self, event, arg1)
+frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" and arg1 == addonName then
         BrewmasterProDB = BrewmasterProDB or {}
 
@@ -764,6 +777,18 @@ frame:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "SPELL_UPDATE_CHARGES" then
         if frame:IsShown() then
             UpdateBar()
+        end
+
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        -- arg1=unit, arg2=castGUID, arg3=spellID
+        if arg1 == "player" and arg3 == SPELL_PURIFYING_BREW then
+            -- Decrement the locally-tracked counter; UpdateBar's pcall path
+            -- uses this when GetSpellCount/secret-value reads don't deliver
+            -- a usable plain integer.
+            if pbTrackedCurrent == nil then pbTrackedCurrent = 2 end
+            pbTrackedCurrent = pbTrackedCurrent - 1
+            if pbTrackedCurrent < 0 then pbTrackedCurrent = 0 end
+            if frame:IsShown() then UpdateBar() end
         end
 
     elseif event == "PLAYER_REGEN_DISABLED" then
@@ -897,12 +922,18 @@ SlashCmdList["BREWMASTERPRODBG"] = function()
     if pbInfo then
         local cur = tonumber(tostring(pbInfo.currentCharges)) or -1
         local mx  = tonumber(tostring(pbInfo.maxCharges)) or -1
-        print(string.format("  PB charges: %d/%d  (cdStart=%s, cdDur=%s)",
+        print(string.format("  PB charges: %d/%d  (cdStart=%s, cdDur=%s, isActive=%s)",
             cur, mx,
-            tostring(pbInfo.cooldownStartTime), tostring(pbInfo.cooldownDuration)))
+            tostring(pbInfo.cooldownStartTime), tostring(pbInfo.cooldownDuration),
+            tostring(pbInfo.isActive)))
     else
         print("  PB charges: C_Spell.GetSpellCharges returned nil")
     end
+    if GetSpellCount then
+        local c = GetSpellCount(SPELL_PURIFYING_BREW)
+        print(string.format("  GetSpellCount: %s (type=%s)", tostring(c), type(c)))
+    end
+    print(string.format("  pbTrackedCurrent: %s", tostring(pbTrackedCurrent)))
     print(string.format("  Frame shown: %s, ticker exists: %s, ticker calls: %s, in combat: %s",
         tostring(BrewmasterProFrame and BrewmasterProFrame:IsShown()),
         tostring(_G.BrewmasterProTicker ~= nil),
