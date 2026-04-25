@@ -477,30 +477,50 @@ GetStaggerAmount = function()
     return s or 0
 end
 
--- WHY: C_Spell.GetSpellCharges returns "secret number values" in current
--- TWW patches as anti-bot protection. Even *reading* a field on the info
--- table propagates taint to the calling function via Lua execution
--- context, so the safest path is to do all the secret-value handling
--- inside pcall and never let the values escape the protected scope.
--- We return only plain primitive numbers from this function.
+-- WHY: C_Spell.GetSpellCharges returns "secret number values" for
+-- currentCharges (not readable even via tostring round-trip), but
+-- isActive is plain boolean and maxCharges/cooldownStartTime/Duration
+-- *are* recoverable via tostring->tonumber. We infer current charges
+-- from isActive + IsUsableSpell instead of reading currentCharges:
+--   isActive=false                 -> full charges (current = max)
+--   isActive=true, IsUsableSpell=1 -> 1 charge ready, 1 recharging
+--   isActive=true, IsUsableSpell=0 -> 0 charges (all gone)
+-- All secret-suspect access lives inside pcall so any taint dies
+-- at the boundary and UpdateBar always completes.
 GetPurifyingBrewState = function()
-    local current, max, remaining = 0, 0, nil
+    local current, max, remaining = 0, 2, nil  -- 2 is PB's known maxCharges
 
     local cs = C_Spell and C_Spell.GetSpellCharges
     if cs then
         pcall(function()
             local info = cs(SPELL_PURIFYING_BREW)
             if not info then return end
-            -- Round-trip through string to strip the secret wrapper before
-            -- doing any comparison. If tonumber fails, value stays at safe
-            -- default (already initialised above). All comparisons live
-            -- inside this pcall so any taint dies at the boundary.
-            local cur = tonumber(tostring(info.currentCharges or "")) or 0
-            local mx  = tonumber(tostring(info.maxCharges or ""))     or 0
-            local st  = tonumber(tostring(info.cooldownStartTime or "")) or 0
-            local du  = tonumber(tostring(info.cooldownDuration or ""))  or 0
-            current, max = cur, mx
-            if cur < mx and st > 0 and du > 0 then
+
+            -- maxCharges is plain in current API; still tostring-trip for safety.
+            local mx = tonumber(tostring(info.maxCharges or "")) or 2
+            max = mx
+
+            -- isActive is a plain boolean — directly readable.
+            local isActive = info.isActive and true or false
+
+            if not isActive then
+                current = mx
+            else
+                -- Spell is on (some) cooldown; check usability for finer state.
+                local usable
+                if C_Spell and C_Spell.IsSpellUsable then
+                    usable = C_Spell.IsSpellUsable(SPELL_PURIFYING_BREW)
+                elseif IsUsableSpell then
+                    usable = IsUsableSpell(SPELL_PURIFYING_BREW)
+                end
+                current = usable and (mx - 1) or 0
+            end
+
+            -- Cooldown timer: cooldownStartTime/Duration ARE recoverable via
+            -- tostring round-trip (unlike currentCharges).
+            local st = tonumber(tostring(info.cooldownStartTime or "")) or 0
+            local du = tonumber(tostring(info.cooldownDuration or "")) or 0
+            if isActive and st > 0 and du > 0 then
                 local r = (st + du) - GetTime()
                 if r < 0 then r = 0 end
                 remaining = r
@@ -530,7 +550,7 @@ GetPurifyingBrewState = function()
         return current, max, remaining
     end
 
-    return 0, 0, nil
+    return 0, 2, nil
 end
 
 -- WHY: Unicode bullets ●○ (U+25CF/U+25CB) are not in FRIZQT__.TTF glyph set
