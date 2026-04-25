@@ -634,6 +634,8 @@ function UpdateBar()
     end
 
     text:SetText(mainText)
+    BrewmasterProLastText = mainText
+    BrewmasterProLastStagger = stagger
 
     -- Flash logic: critical (Heavy + 0 charges) overrides normal flash with red.
     -- WHY: communicates "purify is on cooldown — switch to Celestial/Fortifying"
@@ -848,6 +850,10 @@ SlashCmdList["BREWMASTERPRODBG"] = function()
         tostring(_G.BrewmasterProTicker ~= nil),
         tostring(BrewmasterProTickerCount or 0),
         tostring(InCombatLockdown())))
+    print(string.format("  testMode: %s, testStaggerValue: %s",
+        tostring(testMode), tostring(testStaggerValue)))
+    print(string.format("  Last UpdateBar stagger: %s", tostring(BrewmasterProLastStagger)))
+    print(string.format("  Last UpdateBar text: %s", tostring(BrewmasterProLastText)))
 end
 
 SlashCmdList["BREWMASTERPRO"] = function(msg)
