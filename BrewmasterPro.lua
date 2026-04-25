@@ -478,48 +478,58 @@ GetStaggerAmount = function()
 end
 
 -- WHY: C_Spell.GetSpellCharges returns "secret number values" in current
--- TWW patches as anti-bot protection. Comparing them with <, >, or doing
--- arithmetic taints the addon, aborting UpdateBar via pcall. Round through
--- tostring/tonumber to obtain a plain Lua number that's safe to compare.
-local function Unsecret(v)
-    if v == nil then return nil end
-    return tonumber(tostring(v))
-end
-
--- Returns: charges (number), maxCharges, recharge_remaining_seconds_or_nil
+-- TWW patches as anti-bot protection. Even *reading* a field on the info
+-- table propagates taint to the calling function via Lua execution
+-- context, so the safest path is to do all the secret-value handling
+-- inside pcall and never let the values escape the protected scope.
+-- We return only plain primitive numbers from this function.
 GetPurifyingBrewState = function()
+    local current, max, remaining = 0, 0, nil
+
     local cs = C_Spell and C_Spell.GetSpellCharges
     if cs then
-        local info = cs(SPELL_PURIFYING_BREW)
-        if info then
-            local current = Unsecret(info.currentCharges) or 0
-            local max = Unsecret(info.maxCharges) or 0
-            local startTime = Unsecret(info.cooldownStartTime) or 0
-            local duration = Unsecret(info.cooldownDuration) or 0
-            local remaining
-            if current < max and startTime > 0 and duration > 0 then
-                remaining = (startTime + duration) - GetTime()
-                if remaining < 0 then remaining = 0 end
+        pcall(function()
+            local info = cs(SPELL_PURIFYING_BREW)
+            if not info then return end
+            -- Round-trip through string to strip the secret wrapper before
+            -- doing any comparison. If tonumber fails, value stays at safe
+            -- default (already initialised above). All comparisons live
+            -- inside this pcall so any taint dies at the boundary.
+            local cur = tonumber(tostring(info.currentCharges or "")) or 0
+            local mx  = tonumber(tostring(info.maxCharges or ""))     or 0
+            local st  = tonumber(tostring(info.cooldownStartTime or "")) or 0
+            local du  = tonumber(tostring(info.cooldownDuration or ""))  or 0
+            current, max = cur, mx
+            if cur < mx and st > 0 and du > 0 then
+                local r = (st + du) - GetTime()
+                if r < 0 then r = 0 end
+                remaining = r
             end
-            return current, max, remaining
-        end
+        end)
+        return current, max, remaining
     end
-    -- Legacy fallback
+
+    -- Legacy fallback (older clients without C_Spell.GetSpellCharges)
     if GetSpellCharges then
-        local current, max, start, dur = GetSpellCharges(SPELL_PURIFYING_BREW)
-        current = Unsecret(current)
-        max = Unsecret(max)
-        start = Unsecret(start)
-        dur = Unsecret(dur)
-        if current then
-            local remaining
-            if current < (max or 0) and start and dur then
-                remaining = (start + dur) - GetTime()
-                if remaining < 0 then remaining = 0 end
+        pcall(function()
+            local c, mx, st, du = GetSpellCharges(SPELL_PURIFYING_BREW)
+            c  = tonumber(tostring(c  or ""))
+            mx = tonumber(tostring(mx or ""))
+            st = tonumber(tostring(st or ""))
+            du = tonumber(tostring(du or ""))
+            if c then
+                current = c
+                max = mx or 0
+                if c < (mx or 0) and st and du then
+                    local r = (st + du) - GetTime()
+                    if r < 0 then r = 0 end
+                    remaining = r
+                end
             end
-            return current, max or 0, remaining
-        end
+        end)
+        return current, max, remaining
     end
+
     return 0, 0, nil
 end
 
