@@ -477,23 +477,40 @@ GetStaggerAmount = function()
     return s or 0
 end
 
+-- WHY: C_Spell.GetSpellCharges returns "secret number values" in current
+-- TWW patches as anti-bot protection. Comparing them with <, >, or doing
+-- arithmetic taints the addon, aborting UpdateBar via pcall. Round through
+-- tostring/tonumber to obtain a plain Lua number that's safe to compare.
+local function Unsecret(v)
+    if v == nil then return nil end
+    return tonumber(tostring(v))
+end
+
 -- Returns: charges (number), maxCharges, recharge_remaining_seconds_or_nil
 GetPurifyingBrewState = function()
     local cs = C_Spell and C_Spell.GetSpellCharges
     if cs then
         local info = cs(SPELL_PURIFYING_BREW)
         if info then
+            local current = Unsecret(info.currentCharges) or 0
+            local max = Unsecret(info.maxCharges) or 0
+            local startTime = Unsecret(info.cooldownStartTime) or 0
+            local duration = Unsecret(info.cooldownDuration) or 0
             local remaining
-            if info.currentCharges < info.maxCharges and info.cooldownStartTime and info.cooldownDuration then
-                remaining = (info.cooldownStartTime + info.cooldownDuration) - GetTime()
+            if current < max and startTime > 0 and duration > 0 then
+                remaining = (startTime + duration) - GetTime()
                 if remaining < 0 then remaining = 0 end
             end
-            return info.currentCharges or 0, info.maxCharges or 0, remaining
+            return current, max, remaining
         end
     end
     -- Legacy fallback
     if GetSpellCharges then
         local current, max, start, dur = GetSpellCharges(SPELL_PURIFYING_BREW)
+        current = Unsecret(current)
+        max = Unsecret(max)
+        start = Unsecret(start)
+        dur = Unsecret(dur)
         if current then
             local remaining
             if current < (max or 0) and start and dur then
@@ -848,8 +865,10 @@ SlashCmdList["BREWMASTERPRODBG"] = function()
         print("  Active stagger aura: none")
     end
     if pbInfo then
+        local cur = tonumber(tostring(pbInfo.currentCharges)) or -1
+        local mx  = tonumber(tostring(pbInfo.maxCharges)) or -1
         print(string.format("  PB charges: %d/%d  (cdStart=%s, cdDur=%s)",
-            pbInfo.currentCharges or -1, pbInfo.maxCharges or -1,
+            cur, mx,
             tostring(pbInfo.cooldownStartTime), tostring(pbInfo.cooldownDuration)))
     else
         print("  PB charges: C_Spell.GetSpellCharges returned nil")
