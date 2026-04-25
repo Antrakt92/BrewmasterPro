@@ -161,7 +161,7 @@ local testTicker = nil
 
 -- WHY: OnEnter (tooltip) is bound right below at frame creation but uses these
 -- helpers; without forward declaration the closure resolves them as globals.
-local GetStaggerDuration, GetPurifyingBrewState, FormatPBCharges
+local GetStaggerDuration, GetPurifyingBrewState, FormatPBCharges, GetStaggerAmount
 
 -- Sound alert anti-spam
 local wasAboveAlert = false
@@ -177,7 +177,7 @@ frame:RegisterForDrag("LeftButton")
 frame:SetClampedToScreen(true)
 
 frame:SetScript("OnEnter", function(self)
-    local stagger = (testMode and testStaggerValue) or UnitStagger("player") or 0
+    local stagger = (testMode and testStaggerValue) or GetStaggerAmount()
     local maxHP = UnitHealthMax("player") or 1
     local pct = stagger / maxHP * 100
     local dur = GetStaggerDuration()
@@ -429,19 +429,52 @@ local function IsBrewmaster()
     return spec == 1
 end
 
+-- WHY: returns full stagger debuff data (whichever level is up) — used by
+-- both duration and stagger-amount lookups. Avoids two separate aura scans.
+local function GetActiveStaggerAura()
+    local getAura = C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID
+    if not getAura then return nil end
+    for _, id in ipairs({ STAGGER_HEAVY, STAGGER_MODERATE, STAGGER_LIGHT }) do
+        local data = getAura(id)
+        if data then return data end
+    end
+    return nil
+end
+
 -- WHY: pool decay is 10s default, 15s with Bob and Weave. Reading the live
 -- stagger debuff's `duration` field works regardless of which talent is on.
 GetStaggerDuration = function()
-    local getAura = C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID
-    if getAura then
-        for _, id in ipairs({ STAGGER_HEAVY, STAGGER_MODERATE, STAGGER_LIGHT }) do
-            local data = getAura(id)
-            if data and data.duration and data.duration > 0 then
-                return data.duration
-            end
-        end
+    local data = GetActiveStaggerAura()
+    if data and data.duration and data.duration > 0 then
+        return data.duration
     end
     return STAGGER_DEFAULT_DURATION
+end
+
+-- WHY: UnitStagger("player") sometimes reports 0 mid-combat in current
+-- patches, even when the debuff is clearly applied. Fall back to reading
+-- the aura's `points[1]` which is damage-per-tick — multiplying by tick
+-- count gives total remaining pool. Aura.applications also encodes total
+-- pool on some clients, so we use whichever is non-zero.
+GetStaggerAmount = function()
+    local s = UnitStagger and UnitStagger("player")
+    if s and s > 0 then return s end
+
+    local data = GetActiveStaggerAura()
+    if data then
+        -- points[1] = damage per 0.5s tick; total ticks = duration / 0.5
+        if data.points and data.points[1] and data.duration and data.duration > 0 then
+            local perTick = data.points[1]
+            local ticks = data.duration / 0.5
+            local pool = perTick * ticks
+            if pool > 0 then return pool end
+        end
+        -- Fallback to applications if it carries a non-trivial value
+        if data.applications and data.applications > 1 then
+            return data.applications
+        end
+    end
+    return s or 0
 end
 
 -- Returns: charges (number), maxCharges, recharge_remaining_seconds_or_nil
@@ -504,7 +537,7 @@ function UpdateBar()
     if testMode then
         stagger = testStaggerValue or 0
     else
-        stagger = UnitStagger("player") or 0
+        stagger = GetStaggerAmount()
     end
     local maxHP = UnitHealthMax("player") or 1
     local pct = stagger / maxHP
@@ -701,12 +734,16 @@ end)
 -- only ran when an event happened to fire (UNIT_HEALTH on damage). With this
 -- separate ticker, UpdateBar runs at a steady ~20 Hz no matter what state the
 -- bar is in, so the displayed values stay live throughout combat and decay.
-local ticker = CreateFrame("Frame", nil, UIParent)
+-- Named so it gets a global slot — guarantees no Lua GC, also lets /brewdbg
+-- verify the ticker actually exists in the loaded session.
+local ticker = CreateFrame("Frame", "BrewmasterProTicker", UIParent)
+ticker:SetSize(1, 1)
 local elapsed = 0
 ticker:SetScript("OnUpdate", function(_, delta)
     elapsed = elapsed + delta
     if elapsed >= 0.05 then
         elapsed = 0
+        BrewmasterProTickerCount = (BrewmasterProTickerCount or 0) + 1
         if IsPlayerInWorld() then
             UpdateBar()
         end
@@ -774,6 +811,44 @@ end
 -- ============================================================================
 SLASH_BREWMASTERPRO1 = "/brew"
 SLASH_BREWMASTERPRO2 = "/brewmasterpro"
+
+-- WHY: diagnostic command for debugging "bar shows 0 mid-combat" reports.
+-- Dumps every input UpdateBar relies on so we can pinpoint which API
+-- regressed in a given client patch.
+SLASH_BREWMASTERPRODBG1 = "/brewdbg"
+SlashCmdList["BREWMASTERPRODBG"] = function()
+    local cls = select(2, UnitClass("player")) or "?"
+    local spec = GetSpecialization() or -1
+    local rawStagger = UnitStagger and UnitStagger("player")
+    local computed = GetStaggerAmount()
+    local maxHP = UnitHealthMax("player") or 0
+    local pbInfo = C_Spell and C_Spell.GetSpellCharges and C_Spell.GetSpellCharges(SPELL_PURIFYING_BREW)
+    local aura = GetActiveStaggerAura()
+
+    print("|cff00ff00BrewmasterPro debug|r")
+    print(string.format("  Class: %s, Spec: %d, IsBrewmaster: %s", cls, spec, tostring(IsBrewmaster())))
+    print(string.format("  UnitStagger raw: %s", tostring(rawStagger)))
+    print(string.format("  GetStaggerAmount: %s   (maxHP %s = %.1f%%)", tostring(computed), tostring(maxHP), maxHP > 0 and (computed/maxHP*100) or 0))
+    if aura then
+        print(string.format("  Active stagger aura: id=%s, duration=%s, applications=%s, points[1]=%s",
+            tostring(aura.spellId), tostring(aura.duration), tostring(aura.applications),
+            aura.points and tostring(aura.points[1]) or "nil"))
+    else
+        print("  Active stagger aura: none")
+    end
+    if pbInfo then
+        print(string.format("  PB charges: %d/%d  (cdStart=%s, cdDur=%s)",
+            pbInfo.currentCharges or -1, pbInfo.maxCharges or -1,
+            tostring(pbInfo.cooldownStartTime), tostring(pbInfo.cooldownDuration)))
+    else
+        print("  PB charges: C_Spell.GetSpellCharges returned nil")
+    end
+    print(string.format("  Frame shown: %s, ticker exists: %s, ticker calls: %s, in combat: %s",
+        tostring(BrewmasterProFrame and BrewmasterProFrame:IsShown()),
+        tostring(_G.BrewmasterProTicker ~= nil),
+        tostring(BrewmasterProTickerCount or 0),
+        tostring(InCombatLockdown())))
+end
 
 SlashCmdList["BREWMASTERPRO"] = function(msg)
     local cmd = (msg or ""):lower():match("^%s*(%S*)") or ""
