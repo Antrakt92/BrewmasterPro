@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# WoW runtime artefacts (SavedVariables live outside the addon folder, but
+# guard against accidental commits if anyone copies them in for debugging)
+*.bak
+*.lua.bak
+SavedVariables/

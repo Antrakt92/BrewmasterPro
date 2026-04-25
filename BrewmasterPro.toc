@@ -1,0 +1,16 @@
+## Interface: 120005, 120001, 120000
+## Title: Brewmaster Pro
+## Notes: Brewmaster Monk helper — stagger bar with tick-rate display, Purifying Brew charge tracker, smart sound alerts, and critical "use Celestial / Fortifying" flash. Fork of MonkStaggerBarPrime by bljakk (originally based on work by Roffe and Claude).
+## Author: antrakt92
+## Version: 1.0.0
+## SavedVariables: BrewmasterProDB
+## DefaultState: enabled
+## IconTexture: Interface\AddOns\BrewmasterPro\BrewmasterProIcon
+## X-Category: Combat, Monk, Brewmaster, Tank
+## X-License: MIT
+## X-Website: https://github.com/Antrakt92/BrewmasterPro
+## X-Original-Author: bljakk
+## X-Original-Project: MonkStaggerBarPrime
+
+BrewmasterPro.lua
+BrewmasterPro_Options.lua
