@@ -606,6 +606,14 @@ local shuffleExpiresAt = 0
 local shuffleAlertedThisDrop = false
 local lastShuffleRefreshCastTime = 0
 
+-- Diagnostic: walk all HELPFUL auras periodically + direct GetPlayerAuraBySpellID
+-- result to verify whether 215479 is the right spellID in current player context.
+-- Throttled to 1 walk / 2s in poll-block so /brewdbg dump captures whatever
+-- buff state is current. Field-by-field separate entries so taint of one
+-- doesn't nuke the others on serialization.
+local shuffleDiagSnap = nil
+local shuffleDiagLastWalk = 0
+
 
 -- ============================================================================
 -- Combat event log (ring buffer, in-memory, dumped via /brewdbg)
@@ -975,6 +983,38 @@ UpdateBar = function()
             shuffleAlertedThisDrop = true
         end
 
+        -- DIAGNOSTIC walk: 1 per 2s. Captures direct lookup result + any
+        -- HELPFUL aura whose name contains "Shuffle" with its spellID. If
+        -- 215479 is the wrong ID for current player context, the walk will
+        -- show what spellID actually carries the visible buff.
+        local nowT = GetTime()
+        if (nowT - shuffleDiagLastWalk) >= 2.0 and C_UnitAuras then
+            shuffleDiagLastWalk = nowT
+            local snap = {
+                t = nowT,
+                inCombat = inCombat,
+                directHit = d and true or false,
+                directName = d and d.name or nil,
+                directSpellId = d and d.spellId or nil,
+                directExpires = d and d.expirationTime or nil,
+                directDuration = d and d.duration or nil,
+                walkMatches = {},
+            }
+            local getByIdx = C_UnitAuras.GetAuraDataByIndex
+            if getByIdx then
+                for i = 1, 40 do
+                    local a = getByIdx("player", i, "HELPFUL")
+                    if not a then break end
+                    if a.name and string.find(a.name, "Shuffle") then
+                        snap.walkMatches[#snap.walkMatches + 1] = {
+                            idx = i, name = a.name, spellId = a.spellId,
+                            duration = a.duration, expires = a.expirationTime,
+                        }
+                    end
+                end
+            end
+            shuffleDiagSnap = snap
+        end
     end
 
     local stagger
@@ -1493,6 +1533,17 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
         math.max(0, shuffleExpiresAt - now),
         tostring(shuffleAlertedThisDrop),
         lastShuffleRefreshCastTime > 0 and (now - lastShuffleRefreshCastTime) or 0))
+    if shuffleDiagSnap then
+        print(string.format("  Shuffle diag: directHit=%s, directName=%s, directSpellId=%s, walkMatches=%d",
+            tostring(shuffleDiagSnap.directHit),
+            tostring(shuffleDiagSnap.directName),
+            tostring(shuffleDiagSnap.directSpellId),
+            #shuffleDiagSnap.walkMatches))
+        for _, m in ipairs(shuffleDiagSnap.walkMatches) do
+            print(string.format("    walk[%d]: name=%s spellId=%s dur=%s",
+                m.idx, tostring(m.name), tostring(m.spellId), tostring(m.duration)))
+        end
+    end
     print(string.format("  Frame shown: %s, ticker exists: %s, ticker calls: %s, in combat: %s",
         tostring(BrewmasterProFrame and BrewmasterProFrame:IsShown()),
         tostring(ticker ~= nil),
@@ -1549,6 +1600,7 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
             shuffleRem = math.max(0, shuffleExpiresAt - GetTime()),
             shuffleAlertedThisDrop = shuffleAlertedThisDrop,
             lastShuffleRefreshCastTime = lastShuffleRefreshCastTime,
+            shuffleDiagSnap = shuffleDiagSnap,
             -- Detected talents
             hasBlackoutCombo = hasBlackoutCombo,
             hasPressAdvantage = hasPressAdvantage,
