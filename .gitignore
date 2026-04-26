@@ -15,3 +15,13 @@ desktop.ini
 *.bak
 *.lua.bak
 SavedVariables/
+
+# Dev-internal docs — must NOT leak into the public repo. AI workflow notes,
+# audit backlogs, planning sketches, anything ad-hoc with "private" in the name.
+AUDIT.md
+PLAN.md
+NOTES.md
+TODO.md
+*.private.md
+*.private/
+CLAUDE.md
