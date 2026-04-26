@@ -1582,6 +1582,26 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
                 points1 = aura.points and aura.points[1] or nil,
             }
         end
+        -- Diagnostic: dump ALL helpful auras on the player so we can find
+        -- Shuffle's actual aura spellID without depending on chat output or
+        -- locale-dependent name matching. Cheap (one-shot at /brewdbg time).
+        if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
+            local list = {}
+            for i = 1, 40 do
+                local a = C_UnitAuras.GetAuraDataByIndex("player", i, "HELPFUL")
+                if a and a.name then
+                    list[#list+1] = {
+                        i = i,
+                        name = a.name,
+                        spellId = a.spellId,
+                        duration = a.duration,
+                        remaining = a.expirationTime and (a.expirationTime - GetTime()) or 0,
+                        applications = a.applications,
+                    }
+                end
+            end
+            snap.playerHelpfulAuras = list
+        end
         -- Deep copy event log (raw pbEventLog reference would mutate after dump)
         local logCopy = {}
         for i, e in ipairs(pbEventLog) do
