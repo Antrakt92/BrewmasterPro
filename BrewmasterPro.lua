@@ -635,14 +635,26 @@ local SPELL_BREATH_OF_FIRE = 115181
 local SPELL_BLACKOUT_KICK  = 205523
 local SPELL_SCK            = 322729  -- Spinning Crane Kick
 
--- Shuffle: core Brewmaster mitigation buff (refreshed by Blackout Kick / Keg
--- Smash). When dropped mid-combat, Stagger spike often kills the tank — drop
--- alert sound is the entire Phase 1 of replacing Blizzard Cooldown Manager.
--- WHY: aura fields from C_UnitAuras.GetPlayerAuraBySpellID are NOT secret-
--- tagged in TWW 12.x — direct read of expirationTime works. No queue+CDR
--- machinery needed (unlike PB charge tracker).
-local SPELL_SHUFFLE        = 215479
-local SHUFFLE_RACE_S       = 0.2  -- ignore "dropped" within this window after BoK/KS cast
+-- Shuffle: core Brewmaster mitigation buff. Refreshed by:
+--   Keg Smash       → +5s
+--   Blackout Kick   → +3s
+--   Spinning Crane Kick → +4s
+-- Cap: 15s. When dropped mid-combat, Stagger spike often kills the tank —
+-- drop alert sound is the entire Phase 1 of replacing Blizzard Cooldown Manager.
+--
+-- WHY 322120 not 215479:
+--   215479 — spell TRIGGER (what's cast / appears in spellbook). 5s base in
+--            tooltip is the granted-duration on cast, NOT a buff ID.
+--   322120 — AURA BUFF that actually appears on the player. This is what
+--            C_UnitAuras.GetPlayerAuraBySpellID returns expirationTime for.
+-- Polling 215479 returns nil → state stuck at "dropped" → false-positive alert
+-- on combat enter, latch never re-arms. Empirically discovered after Phase 1
+-- ship: alert fires once at combat start then never again.
+--
+-- WHY this is safe to read directly: aura fields from C_UnitAuras are NOT
+-- secret-tagged in TWW 12.x. No queue+CDR machinery needed (unlike PB).
+local SPELL_SHUFFLE        = 322120
+local SHUFFLE_RACE_S       = 0.2  -- ignore "dropped" within this window after BoK/KS/SCK cast
 
 -- ============================================================================
 -- Talent detection — adjust CDR constants based on player's active build
@@ -1277,6 +1289,11 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
                 end
                 -- BoK refreshes Shuffle вне зависимости от Blackout Combo талента
                 -- (это базовая механика спека). Штамп ставим всегда.
+                lastShuffleRefreshCastTime = GetTime()
+
+            elseif arg3 == SPELL_SCK then
+                -- Spinning Crane Kick refreshes Shuffle (+4s in TWW 12.x).
+                -- Race-stamp only — no PB CDR interaction.
                 lastShuffleRefreshCastTime = GetTime()
 
             elseif arg3 == SPELL_BLACK_OX_BREW then
