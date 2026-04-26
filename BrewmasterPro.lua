@@ -606,16 +606,6 @@ local shuffleExpiresAt = 0
 local shuffleAlertedThisDrop = false
 local lastShuffleRefreshCastTime = 0
 
--- Diagnostic aura snapshot: captured every UpdateBar tick (untainted addon
--- code path), then READ by /brewdbg without re-walking. WHY this indirection:
--- in TWW 12.0.5, slash-command execution is tainted by ForceTaint_Strong,
--- and `aura.name` field returns a SECRET STRING in that context — accessing
--- it errors with "attempt to index field 'name' (a secret string value)".
--- Walking auras inside the slash handler aborts the entire dump. Capturing
--- in addon-event code (this file's UpdateBar / OnEvent) avoids the taint.
-local diagPlayerAuras = {}
-local diagHarmfulAuras = {}
-local diagShuffleLookup = {}  -- direct GetPlayerAuraBySpellID test for known candidate IDs
 
 -- ============================================================================
 -- Combat event log (ring buffer, in-memory, dumped via /brewdbg)
@@ -653,18 +643,18 @@ local SPELL_SCK            = 322729  -- Spinning Crane Kick
 -- Cap: 15s. When dropped mid-combat, Stagger spike often kills the tank —
 -- drop alert sound is the entire Phase 1 of replacing Blizzard Cooldown Manager.
 --
--- WHY 322120 not 215479:
---   215479 — spell TRIGGER (what's cast / appears in spellbook). 5s base in
---            tooltip is the granted-duration on cast, NOT a buff ID.
---   322120 — AURA BUFF that actually appears on the player. This is what
---            C_UnitAuras.GetPlayerAuraBySpellID returns expirationTime for.
--- Polling 215479 returns nil → state stuck at "dropped" → false-positive alert
--- on combat enter, latch never re-arms. Empirically discovered after Phase 1
--- ship: alert fires once at combat start then never again.
+-- WHY 215479: empirically verified via aura-walk + GetPlayerAuraBySpellID
+-- direct lookup that this is the spellID of the visible aura buff on the
+-- player (returns table with name="Shuffle", real expirationTime).
+-- Wowhead lists a second spellID 322120 named "Shuffle" but it's a passive
+-- talent ("Apply Aura: Dummy") — NOT an aura that appears on the player.
+-- GetPlayerAuraBySpellID(322120) returns nil even when Shuffle is up.
 --
--- WHY this is safe to read directly: aura fields from C_UnitAuras are NOT
--- secret-tagged in TWW 12.x. No queue+CDR machinery needed (unlike PB).
-local SPELL_SHUFFLE        = 322120
+-- WHY chat /run testing was misleading: TWW 12.0.5 taints slash commands
+-- with ForceTaint_Strong. In that tainted context, GetPlayerAuraBySpellID
+-- may return nil/secret values even for active auras. Always verify via
+-- addon code path (event handlers, UpdateBar) — never trust /run output.
+local SPELL_SHUFFLE        = 215479
 local SHUFFLE_RACE_S       = 0.2  -- ignore "dropped" within this window after BoK/KS/SCK cast
 
 -- ============================================================================
@@ -985,59 +975,6 @@ UpdateBar = function()
             shuffleAlertedThisDrop = true
         end
 
-        -- Diagnostic aura capture: walk all helpful + harmful auras and
-        -- stash to module-local. Read by /brewdbg without re-walking.
-        -- Safe here — UpdateBar runs in untainted addon-code path.
-        if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
-            local helpful = {}
-            for i = 1, 40 do
-                local a = C_UnitAuras.GetAuraDataByIndex("player", i, "HELPFUL")
-                if not a then break end
-                helpful[#helpful+1] = {
-                    i = i, name = a.name, spellId = a.spellId,
-                    duration = a.duration,
-                    remaining = a.expirationTime and (a.expirationTime - GetTime()) or 0,
-                    applications = a.applications,
-                }
-            end
-            diagPlayerAuras = helpful
-
-            local harmful = {}
-            for i = 1, 40 do
-                local a = C_UnitAuras.GetAuraDataByIndex("player", i, "HARMFUL")
-                if not a then break end
-                harmful[#harmful+1] = {
-                    i = i, name = a.name, spellId = a.spellId,
-                    duration = a.duration,
-                    remaining = a.expirationTime and (a.expirationTime - GetTime()) or 0,
-                    applications = a.applications,
-                }
-            end
-            diagHarmfulAuras = harmful
-        end
-
-        -- Direct GetPlayerAuraBySpellID test for candidate Shuffle IDs.
-        -- Returns table if aura visible (regardless of helpful/harmful),
-        -- or nil if no such aura on player. Captures `expirationTime - now`
-        -- so we see whether duration is 0 (passive) or a real countdown.
-        if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
-            local now = GetTime()
-            local lookup = {}
-            for _, sid in ipairs({215479, 322120}) do
-                local a = C_UnitAuras.GetPlayerAuraBySpellID(sid)
-                if a then
-                    lookup[tostring(sid)] = {
-                        found = true, name = a.name,
-                        spellId = a.spellId, duration = a.duration,
-                        remaining = a.expirationTime and (a.expirationTime - now) or 0,
-                        applications = a.applications,
-                    }
-                else
-                    lookup[tostring(sid)] = { found = false }
-                end
-            end
-            diagShuffleLookup = lookup
-        end
     end
 
     local stagger
@@ -1647,12 +1584,6 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
                 points1 = aura.points and aura.points[1] or nil,
             }
         end
-        -- Diagnostic: read pre-captured aura lists. WHY captured in UpdateBar
-        -- not here: TWW 12.0.5 taints slash commands with ForceTaint_Strong,
-        -- making `a.name` return secret strings → indexing aborts the dump.
-        snap.playerHelpfulAuras = diagPlayerAuras
-        snap.playerHarmfulAuras = diagHarmfulAuras
-        snap.shuffleLookup = diagShuffleLookup
         -- Deep copy event log (raw pbEventLog reference would mutate after dump)
         local logCopy = {}
         for i, e in ipairs(pbEventLog) do
