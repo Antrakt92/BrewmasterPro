@@ -97,25 +97,6 @@ local function Clamp(n, minv, maxv)
 end
 ns.Clamp = Clamp
 
--- WHY: C_Spell.GetSpellCharges in TWW 11.x+ returns "secret number values" for
--- some fields. Direct comparison/arithmetic on them taints AND errors. But
--- `tostring(secret)` returns the live string representation as a plain Lua
--- string — which we can re-parse via tonumber to get a clean number that
--- comparisons CAN'T taint (it's no longer the secret value, just a copy).
---
--- IMPORTANT: do NOT wrap in pcall. Empirically (verified via /brewdbg
--- TICK log post-combat-enter): `pcall(tostring, secret)` returns ok=false
--- — Blizzard's secret-value protection appears to detect protected-mode
--- calls and refuses the conversion. Direct `tostring(secret)` succeeds
--- and returns the real number string. The addon may briefly enter taint
--- state but we never call secure APIs in the hot path so it's harmless.
-local function unsecret(value)
-    if value == nil then return nil end
-    local s = tostring(value)
-    if s == nil then return nil end
-    return tonumber(s)
-end
-
 local function FormatNumber(num)
     if num >= 1000000 then
         return string.format("%.1fM", num / 1000000)
@@ -731,30 +712,15 @@ local function spellLabel(spellID)
     return tostring(spellID)
 end
 
--- Live haste-modified PB recharge. Tries to read info.cooldownDuration
--- whenever isActive=false (the field is NOT secret-tagged when no charge
--- is on cooldown — verified via /brewdbg pre-combat). When unreadable
--- (in-combat / mid-cycle), falls back to the cached value. This catches
--- haste changes that occur between full-restore moments (Bloodlust,
--- trinket procs, gear swaps).
+-- WHY no PB_UpdateRechargeFromAPI: any read of info.cooldownDuration via
+-- tostring/concat (the only laundering we have) creates sticky addon-level
+-- taint that persists across OnUpdate ticks. After such taint, secure
+-- APIs called later (notably `C_UnitAuras.GetPlayerAuraBySpellID`) return
+-- nil — silently breaking Shuffle drop alert and any future aura tracker.
+-- We accept the cost: pbCachedRecharge stays at the hardcoded baseline
+-- and SELF-CORR drift recalibration in the cast handler dynamically tunes
+-- it when haste changes mid-fight.
 local pbCachedRecharge = PB_BASE_RECHARGE_S
-local function PB_UpdateRechargeFromAPI()
-    local cs = C_Spell and C_Spell.GetSpellCharges
-    if not cs then return end
-    local info = cs(SPELL_PURIFYING_BREW)
-    if not info then return end
-    -- Only read when no charge on cooldown — at full charges, the field
-    -- is the haste-modified base recharge time as a plain number.
-    if info.isActive then return end
-    local d = unsecret(info.cooldownDuration)
-    if d and d > 5 and d < 60 then
-        if math.abs(d - pbCachedRecharge) > 0.05 then
-            PB_Log("Q-RECHARGE", string.format("base=%.3f (was %.3f)",
-                d, pbCachedRecharge))
-        end
-        pbCachedRecharge = d
-    end
-end
 
 -- Queue a future restore time for the just-consumed PB charge. New restore
 -- starts after the LAST entry in queue (charges recharge sequentially) or
@@ -895,9 +861,6 @@ GetPurifyingBrewState = function()
         end
         pbCount = max
         PB_ResetQueue()
-        -- Full-restore moment is the rare window where cooldownDuration
-        -- isn't secret-tagged. Refresh our cached haste-modified recharge.
-        PB_UpdateRechargeFromAPI()
         return pbCount, max, remaining
     end
 
@@ -1166,11 +1129,10 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
 
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_SPECIALIZATION_CHANGED" then
         inCombat = InCombatLockdown() and true or false
-        -- Probe talents and live recharge time on world-enter / spec change.
-        -- Both APIs may be unstable in the first second of login, but the
-        -- TALENT_UPDATE / TRAIT_CONFIG_UPDATED handlers will re-probe later.
+        -- Probe talents on world-enter / spec change. (No live recharge probe
+        -- because info.cooldownDuration laundering taints the addon — see
+        -- pbCachedRecharge declaration. SELF-CORR drift logic adapts at runtime.)
         PB_DetectTalents()
-        PB_UpdateRechargeFromAPI()
         UpdateBar()
 
     elseif event == "PLAYER_TALENT_UPDATE" or event == "TRAIT_CONFIG_UPDATED" then
@@ -1183,10 +1145,6 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
         -- arg1 may carry spellID in modern retail (parameterless on legacy
         -- clients). Log the raw value to find out empirically.
         PB_Log("UPD", "spellID=" .. tostring(arg1))
-        -- Cheap opportunity to refresh haste-modified base recharge: if PB
-        -- just hit a state where isActive=false (full restore), this is
-        -- the only window where info.cooldownDuration isn't secret.
-        PB_UpdateRechargeFromAPI()
         if frame:IsShown() then
             UpdateBar()
         end
