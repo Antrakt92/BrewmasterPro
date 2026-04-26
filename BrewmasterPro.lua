@@ -1208,11 +1208,32 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
                 -- via secret-tagged API). Bump to 1 BEFORE decrementing.
                 local before = pbCount
                 if pbCount == 0 then
+                    -- The popped queue entry's predicted time was late (else
+                    -- it'd have already popped via PB_ProcessQueue). Drift
+                    -- = how much later than reality our prediction was.
+                    -- Use it to (1) recalibrate cached recharge — the same
+                    -- haste/CDR conditions apply to remaining entries, so
+                    -- future push'es should be shorter; (2) shift remaining
+                    -- queue entries -drift so they restore sooner instead
+                    -- of stacking the drift forward through Q-PUSH.
+                    local nowT = GetTime()
+                    local staleHead = pbRestoreQueue[1]
+                    local drift = (staleHead and staleHead > nowT) and (staleHead - nowT) or 0
+                    if drift > 0.5 and drift < 10 then
+                        local corrected = pbCachedRecharge - drift
+                        if corrected > 5 and corrected < 30 then
+                            PB_Log("Q-RECAL", string.format("recharge %.2f→%.2f (drift=%.1fs)",
+                                pbCachedRecharge, corrected, drift))
+                            pbCachedRecharge = corrected
+                        end
+                        -- Shift remaining entries (after head we're about to pop)
+                        for i = 2, #pbRestoreQueue do
+                            pbRestoreQueue[i] = pbRestoreQueue[i] - drift
+                        end
+                    end
                     pbCount = 1
-                    PB_Log("SELF-CORR", string.format("0→1 before DEC (missed restore)"))
-                    -- Pop the corresponding queue entry — the charge we just
-                    -- "discovered" was already restored, so it shouldn't fire
-                    -- a second time later.
+                    PB_Log("SELF-CORR", string.format("0→1 before DEC (drift=%.1fs)", drift))
+                    -- Pop the stale head — that charge already restored in reality.
                     if pbRestoreQueue[1] then
                         table.remove(pbRestoreQueue, 1)
                     end
