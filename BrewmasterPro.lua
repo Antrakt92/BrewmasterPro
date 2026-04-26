@@ -13,6 +13,10 @@ local STAGGER_HEAVY    = 124273
 
 -- Brewmaster signature spells used for charge / talent detection
 local SPELL_PURIFYING_BREW = 119582
+-- WHY: PB has shipped with 2 charges across all of TWW. Used as a fallback
+-- value when the API can't report maxCharges (spell not yet known on a fresh
+-- character, or the secret-value mechanism makes the real value unreadable).
+local PB_DEFAULT_MAX_CHARGES = 2
 -- WHY: stagger pool decays over 10s baseline, 15s with Bob and Weave talent.
 -- Read the live debuff's duration field for an accurate, talent-agnostic value.
 local STAGGER_DEFAULT_DURATION = 10
@@ -93,6 +97,25 @@ local function Clamp(n, minv, maxv)
 end
 ns.Clamp = Clamp
 
+-- WHY: C_Spell.GetSpellCharges in TWW 11.x+ returns "secret number values" for
+-- some fields. Direct comparison/arithmetic on them taints AND errors. But
+-- `tostring(secret)` returns the live string representation as a plain Lua
+-- string — which we can re-parse via tonumber to get a clean number that
+-- comparisons CAN'T taint (it's no longer the secret value, just a copy).
+--
+-- IMPORTANT: do NOT wrap in pcall. Empirically (verified via /brewdbg
+-- TICK log post-combat-enter): `pcall(tostring, secret)` returns ok=false
+-- — Blizzard's secret-value protection appears to detect protected-mode
+-- calls and refuses the conversion. Direct `tostring(secret)` succeeds
+-- and returns the real number string. The addon may briefly enter taint
+-- state but we never call secure APIs in the hot path so it's harmless.
+local function unsecret(value)
+    if value == nil then return nil end
+    local s = tostring(value)
+    if s == nil then return nil end
+    return tonumber(s)
+end
+
 local function FormatNumber(num)
     if num >= 1000000 then
         return string.format("%.1fM", num / 1000000)
@@ -137,6 +160,10 @@ local defaults = {
     -- Bar text extras
     showTickRate = true,
     showPBCharges = true,
+
+    -- Shuffle drop alert (Phase 1 of full UI replacement; visual tracker → Phase 2)
+    shuffleAlertEnabled = true,
+    shuffleAlertSoundIndex = 1,
 }
 ns.defaults = defaults
 
@@ -159,9 +186,24 @@ local testMode = false
 local testStaggerValue = 0
 local testTicker = nil
 
+-- Diagnostics — exposed via /brewdbg, kept module-local (no _G pollution).
+-- Counters help isolate "bar froze mid-combat" vs "addon errored silently"
+-- when /console scriptErrors 0 hides the usual error popup.
+local diagTickerCount = 0
+local diagSuccessCount = 0
+local diagErrorCount = 0
+local diagLastError = nil
+local diagLastText = nil
+local diagLastStagger = nil
+
 -- WHY: OnEnter (tooltip) is bound right below at frame creation but uses these
 -- helpers; without forward declaration the closure resolves them as globals.
 local GetStaggerDuration, GetPurifyingBrewState, FormatPBCharges, GetStaggerAmount
+-- WHY: UpdateBar / ApplySettings / ToggleStaggerBarTest are referenced by
+-- closures defined before their bodies (and by the Options file via ns.*).
+-- Forward-declared as locals so they DON'T leak into _G — global names like
+-- "UpdateBar" and "ApplySettings" risk collision with other status-bar addons.
+local UpdateBar, ApplySettings, ToggleStaggerBarTest
 
 -- Sound alert anti-spam
 local wasAboveAlert = false
@@ -375,7 +417,7 @@ local function StopFlashBorder()
     flashBorder:Hide()
 end
 
-function ApplySettings()
+ApplySettings = function()
     local db = BrewmasterProDB
     if not db then return end
 
@@ -477,90 +519,393 @@ GetStaggerAmount = function()
     return s or 0
 end
 
--- WHY: tracks PB charges across casts when API can't give us a plain count.
--- We watch SPELL_UPDATE_CHARGES + UNIT_SPELLCAST_SUCCEEDED to maintain
--- a local counter that decrements on cast and restores when recharge
--- timer reaches zero.
-local pbTrackedCurrent = nil
-local pbTrackedNextRecharge = 0
+-- WHY: PB charge counter via predicted-restore queue with explicit CDR
+-- tracking from cast events. ALL TWW 12.x cooldown APIs are closed under
+-- secret-value protection (verified via /brewdbg dual-API logging):
+--   * GetSpellCharges.{cooldownStartTime,cooldownDuration,currentCharges} → secret
+--   * GetSpellCooldown.{startTime,duration} → secret
+--   * GetActionCharges current/max → secret
+--   * tostring(secret) returns a SECRET STRING that propagates taint through
+--     string.format. Even SavedVariables serializer writes the result as
+--     `nil --[[secret value]]`. unsecret() laundering CANNOT recover the
+--     numeric value — Blizzard fully closed this back-channel.
+-- IsSpellUsable returns true even at 0 charges for free spells — useless.
+--
+-- Signals we DO trust (still readable):
+--   - UNIT_SPELLCAST_SUCCEEDED + spellID                — authoritative cast
+--   - info.isActive (boolean) from GetSpellCharges      — "any charge on CD?"
+--   - info.isEnabled (boolean) from GetSpellCooldown    — "spell available?"
+--
+-- Algorithm:
+--   1) On PB cast: pbCount--; push expected-restore time = (lastQueueTime
+--      OR now) + PB_BASE_RECHARGE_S to pbRestoreQueue.
+--   2) On Tiger Palm cast: subtract PB_CDR_TIGER_PALM_S from queue head.
+--   3) On Keg Smash cast: subtract PB_CDR_KEG_SMASH_S from queue head.
+--   4) On Black Ox Brew cast: queue cleared, pbCount = max (instant reset).
+--   5) Every UpdateBar tick: while queue head <= now → pop, pbCount++.
+--   6) On info.isActive=false (post race window): hard reset to max — covers
+--      drift from talent-modified CDR amounts and unhandled procs.
+--   7) Self-correcting cast: if pbCount==0 when PB cast event fires,
+--      WoW would not have produced the event — so a charge MUST have been
+--      available we missed. Bump pbCount to 1 BEFORE decrement.
+--
+-- Race protection: 0.2s window after each cast — isActive=false in that
+-- window is potentially stale (API lags ~1 frame behind the event) and
+-- must NOT trigger the reset that would overwrite our decrement.
+--
+-- Drift expectation: ±1s when talent-modified CDR amounts differ from the
+-- baseline constants below. Self-corrects on every full reset (combat end,
+-- isActive=false). Acceptable trade-off given API closure.
 
--- WHY: C_Spell.GetSpellCharges' currentCharges is a "secret number value"
--- that can't even be read via tostring (returns "<no value>"-equivalent).
--- IsSpellUsable doesn't help for PB because it has no resource cost (always
--- returns true even at 0 charges). GetSpellCount is the long-standing
--- fallback that returns a plain integer for charged spells. If it works,
--- we use it directly; otherwise we fall back to event-based tracking.
--- All secret-suspect access lives inside pcall so taint dies at the boundary.
+local pbCount = nil          -- current charges; nil = uninitialized
+local pbLastCastTime = 0     -- for race protection against stale isActive
+local pbRestoreQueue = {}    -- list of GetTime() timestamps when next charge restores
+
+-- WHY: PB base recharge in seconds. Verified pre-combat via /brewdbg
+-- (when not yet secret-tagged) on a Brewmaster monk in TWW 12.0.x:
+-- info.cooldownDuration = 17.866. Hardcoded since once combat starts, the
+-- field becomes secret and we can never re-read it.
+local PB_BASE_RECHARGE_S = 17.866
+-- WHY: baseline Brewmaster CDR amounts (in-game tooltip):
+--   Tiger Palm    "reduces the cooldown of your Brews by 1 sec"
+--   Keg Smash     "reduces the cooldown of all your Brews by 3 seconds"
+-- Talent modifiers tracked dynamically below:
+--   Blackout Combo (talent 196736): next Keg Smash AFTER Blackout Kick
+--     gives +2s extra CDR (5s total), but only when KS consumes the buff.
+--     If TP consumes it instead (Brewmaster guide rotation prefers TP for
+--     damage), no extra PB CDR. We track the buff and apply +2 only when
+--     KS fires while buff is active.
+--   Light Brewing (talent 196721): -X% PB base recharge. We pick this up
+--     dynamically by reading info.cooldownDuration when isActive=false.
+--   Press the Advantage (talent 418359): replaces Tiger Palm. If the user
+--     has this talent, our TP CDR tracker simply never fires — no harm.
+local PB_CDR_TIGER_PALM_S        = 1.0
+local PB_CDR_KEG_SMASH_S         = 3.0
+local PB_CDR_KEG_SMASH_BOC_BONUS = 2.0  -- extra CDR when KS consumes Blackout Combo buff
+-- Buff state from Blackout Kick (Brewmaster ID 205523). Each BoK sets the
+-- flag; next TP or KS consumes it. We can't read the BoC buff status via
+-- secret-tag-restricted APIs, so we model it from cast events instead.
+local pbBoCActive = false
+
+-- High Tolerance refund tracking. The talent triggers in "Elevated Stagger":
+-- (a) player has Heavy Stagger debuff, OR (b) player recently took a "large
+-- hit". We approximate (b) by listening to combat log damage events on the
+-- player above HEAVY_HIT_THRESHOLD of max HP, and treating the next ~5s as
+-- "Elevated Stagger" window.
+local PB_HT_REFUND_S = 3.0          -- per-cast refund estimate; tune if drift
+local PB_HT_HIT_THRESHOLD_FRAC = 0.05  -- 5% of max HP = "large hit"
+local PB_HT_WINDOW_S = 5.0          -- recent-hit window
+local pbLastHeavyHitTime = 0
+
+-- Shuffle drop alert state. Written by UpdateBar poll-block and by
+-- UNIT_SPELLCAST_SUCCEEDED (BoK/KS race-window stamp). Read by UpdateBar.
+-- WHY: latch reset on PLAYER_REGEN_DISABLED is load-bearing — without it,
+-- entering a new combat with Shuffle already dropped would silently skip
+-- the alert (latch stays armed from previous combat's drop).
+local shuffleExpiresAt = 0
+local shuffleAlertedThisDrop = false
+local lastShuffleRefreshCastTime = 0
+
+-- ============================================================================
+-- Combat event log (ring buffer, in-memory, dumped via /brewdbg)
+-- ============================================================================
+-- WHY: secret-value bugs are time-dependent (race conditions, transitions).
+-- A single /brewdbg snapshot rarely captures the failure moment. The log
+-- records every cast, every SPELL_UPDATE_CHARGES, and a periodic state
+-- sample so a single /brewdbg dump shows the full timeline of a buggy
+-- combat — including what spells the user pressed and what the API
+-- reported at each tick. Capped at PB_LOG_MAX entries (oldest fall off).
+local pbEventLog = {}
+local PB_LOG_MAX = 300
+local pbLogStartTime = 0     -- relative t=0 reference for log entries
+local pbLogLastSample = 0    -- throttle for periodic TICK samples
+
+-- WHY: brewmaster spells we care about for diagnosis. Raw ID for anything
+-- else so we still see what the user pressed without maintaining a huge
+-- spell DB.
+local SPELL_TIGER_PALM     = 100780  -- -1s PB recharge
+local SPELL_KEG_SMASH      = 121253  -- -3s PB recharge
+local SPELL_BLACK_OX_BREW  = 115399  -- instant full PB reset (talent)
+local SPELL_CELESTIAL_BREW = 322507
+local SPELL_FORTIFYING_BREW = 115203
+local SPELL_BREATH_OF_FIRE = 115181
+-- WHY: Brewmaster Blackout Kick spell ID is 205523 in TWW (not the WW
+-- version 100784). Verified empirically via /brewdbg cast log on a
+-- Brewmaster Monk. Used to track Blackout Combo buff state.
+local SPELL_BLACKOUT_KICK  = 205523
+local SPELL_SCK            = 322729  -- Spinning Crane Kick
+
+-- Shuffle: core Brewmaster mitigation buff (refreshed by Blackout Kick / Keg
+-- Smash). When dropped mid-combat, Stagger spike often kills the tank — drop
+-- alert sound is the entire Phase 1 of replacing Blizzard Cooldown Manager.
+-- WHY: aura fields from C_UnitAuras.GetPlayerAuraBySpellID are NOT secret-
+-- tagged in TWW 12.x — direct read of expirationTime works. No queue+CDR
+-- machinery needed (unlike PB charge tracker).
+local SPELL_SHUFFLE        = 215479
+local SHUFFLE_RACE_S       = 0.2  -- ignore "dropped" within this window after BoK/KS cast
+
+-- ============================================================================
+-- Talent detection — adjust CDR constants based on player's active build
+-- ============================================================================
+-- Talent IDs are MORE STABLE across patches than node/entry IDs. We probe
+-- by spellID via IsSpellKnown / FindSpellOverrideByID and infer the spec
+-- talents that affect PB CDR. The talent SPELLS:
+--   Blackout Combo:        196736 — gives KS the +2s bonus
+--   Press the Advantage:   418359 — replaces Tiger Palm
+--   Light Brewing:         196721 — reduces PB base recharge
+--   Meditative Focus:      452414 — buffs BoC further (Hero talent)
+--   High Tolerance:        196737 — refunds PB CD on Elevated Stagger cast
+-- WHY: PB_Log declared BEFORE the talent-detection block because
+-- PB_DetectTalents calls PB_Log. Lua resolves local names lexically at
+-- function definition time — if PB_Log isn't a known local at that
+-- point, it falls back to a nil _G lookup at call time → "attempt to
+-- call a nil value" runtime error.
+local function PB_Log(ev, payload)
+    if pbLogStartTime == 0 then pbLogStartTime = GetTime() end
+    pbEventLog[#pbEventLog + 1] = {
+        t = GetTime() - pbLogStartTime,
+        ev = ev,
+        p = payload or "",
+    }
+    while #pbEventLog > PB_LOG_MAX do
+        table.remove(pbEventLog, 1)
+    end
+end
+
+local TALENT_BLACKOUT_COMBO     = 196736
+local TALENT_PRESS_ADVANTAGE    = 418359
+local TALENT_LIGHT_BREWING      = 196721
+local TALENT_MEDITATIVE_FOCUS   = 452414
+local TALENT_HIGH_TOLERANCE     = 196737
+
+-- Detected talent state (set on PLAYER_TALENT_UPDATE). nil = unknown.
+local hasBlackoutCombo   = false
+local hasPressAdvantage  = false
+local hasLightBrewing    = false
+local hasMeditativeFocus = false
+local hasHighTolerance   = false
+
+-- WHY: IsPlayerSpell(spellID) returns true if the spell is currently in
+-- the player's spellbook — this includes spells granted by talents. Far
+-- simpler than walking the C_Traits tree, and stable across talent UI
+-- refactors. Returns false for talents the player hasn't selected.
+local function PB_DetectTalents()
+    local IsPlayerSpell = _G.IsPlayerSpell
+    if not IsPlayerSpell then return end
+
+    hasBlackoutCombo   = IsPlayerSpell(TALENT_BLACKOUT_COMBO)   and true or false
+    hasPressAdvantage  = IsPlayerSpell(TALENT_PRESS_ADVANTAGE)  and true or false
+    hasLightBrewing    = IsPlayerSpell(TALENT_LIGHT_BREWING)    and true or false
+    hasMeditativeFocus = IsPlayerSpell(TALENT_MEDITATIVE_FOCUS) and true or false
+    hasHighTolerance   = IsPlayerSpell(TALENT_HIGH_TOLERANCE)   and true or false
+
+    PB_Log("TALENTS", string.format("BoC=%s PtA=%s LB=%s MF=%s HT=%s",
+        tostring(hasBlackoutCombo), tostring(hasPressAdvantage),
+        tostring(hasLightBrewing), tostring(hasMeditativeFocus),
+        tostring(hasHighTolerance)))
+end
+
+local function spellLabel(spellID)
+    if spellID == SPELL_PURIFYING_BREW   then return "PB" end
+    if spellID == SPELL_TIGER_PALM       then return "TigerPalm" end
+    if spellID == SPELL_KEG_SMASH        then return "KegSmash" end
+    if spellID == SPELL_BLACK_OX_BREW    then return "BlackOxBrew" end
+    if spellID == SPELL_CELESTIAL_BREW   then return "CelestialBrew" end
+    if spellID == SPELL_FORTIFYING_BREW  then return "FortifyingBrew" end
+    if spellID == SPELL_BREATH_OF_FIRE   then return "BreathOfFire" end
+    if spellID == SPELL_BLACKOUT_KICK    then return "BlackoutKick" end
+    if spellID == SPELL_SCK              then return "SCK" end
+    return tostring(spellID)
+end
+
+-- Live haste-modified PB recharge. Tries to read info.cooldownDuration
+-- whenever isActive=false (the field is NOT secret-tagged when no charge
+-- is on cooldown — verified via /brewdbg pre-combat). When unreadable
+-- (in-combat / mid-cycle), falls back to the cached value. This catches
+-- haste changes that occur between full-restore moments (Bloodlust,
+-- trinket procs, gear swaps).
+local pbCachedRecharge = PB_BASE_RECHARGE_S
+local function PB_UpdateRechargeFromAPI()
+    local cs = C_Spell and C_Spell.GetSpellCharges
+    if not cs then return end
+    local info = cs(SPELL_PURIFYING_BREW)
+    if not info then return end
+    -- Only read when no charge on cooldown — at full charges, the field
+    -- is the haste-modified base recharge time as a plain number.
+    if info.isActive then return end
+    local d = unsecret(info.cooldownDuration)
+    if d and d > 5 and d < 60 then
+        if math.abs(d - pbCachedRecharge) > 0.05 then
+            PB_Log("Q-RECHARGE", string.format("base=%.3f (was %.3f)",
+                d, pbCachedRecharge))
+        end
+        pbCachedRecharge = d
+    end
+end
+
+-- Queue a future restore time for the just-consumed PB charge. New restore
+-- starts after the LAST entry in queue (charges recharge sequentially) or
+-- from `now` if queue empty. Uses live haste-modified recharge.
+local function PB_QueueRestore()
+    local now = GetTime()
+    local lastEnd = pbRestoreQueue[#pbRestoreQueue] or now
+    if lastEnd < now then lastEnd = now end
+    local restoreAt = lastEnd + pbCachedRecharge
+    pbRestoreQueue[#pbRestoreQueue + 1] = restoreAt
+    PB_Log("Q-PUSH", string.format("at=%.2f (in %.2fs) qLen=%d base=%.2f",
+        restoreAt, restoreAt - now, #pbRestoreQueue, pbCachedRecharge))
+end
+
+-- Apply CDR to ALL entries in the queue. Charges restore SEQUENTIALLY in
+-- WoW: charge N+1's timer doesn't start until charge N restores. If we
+-- accelerate the head by Xs, every subsequent charge ALSO restores Xs
+-- earlier (the chain shifts forward as one). Shifting only the head
+-- corrupts the inter-charge gap and over-predicts later restores by
+-- the cumulative CDR.
+local function PB_ApplyCDR(seconds, source)
+    if #pbRestoreQueue == 0 then return end
+    for i = 1, #pbRestoreQueue do
+        pbRestoreQueue[i] = pbRestoreQueue[i] - seconds
+    end
+    -- If front now in past, the OnUpdate sweep will pop it next tick.
+    PB_Log("Q-CDR", string.format("%s -%.1fs head=%.2f qLen=%d",
+        source, seconds, pbRestoreQueue[1], #pbRestoreQueue))
+end
+
+-- Clear queue and force-reset to max (Black Ox Brew, isActive=false reset).
+local function PB_ResetQueue()
+    if #pbRestoreQueue > 0 then
+        PB_Log("Q-CLEAR", string.format("qLen=%d", #pbRestoreQueue))
+    end
+    pbRestoreQueue = {}
+end
+
+-- "Elevated Stagger" detection for High Tolerance talent. True if the
+-- player has Heavy Stagger debuff active OR took a heavy hit in the last
+-- PB_HT_WINDOW_S seconds.
+local function PB_IsElevatedStagger()
+    if (GetTime() - pbLastHeavyHitTime) < PB_HT_WINDOW_S then
+        return true
+    end
+    local getAura = C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID
+    if getAura and getAura(STAGGER_HEAVY) then
+        return true
+    end
+    return false
+end
+
+-- Apply High Tolerance cooldown refund to the head of the queue. Called
+-- from PB cast handler when the talent is selected and we're in Elevated
+-- Stagger. Refund only makes sense if at least one charge is on cooldown
+-- (the just-pushed entry counts).
+local function PB_ApplyHTRefund()
+    if #pbRestoreQueue == 0 then return end
+    -- Refund applies to ALL entries in queue (sequential recharge — head
+    -- finishing earlier means everything down the chain finishes earlier).
+    for i = 1, #pbRestoreQueue do
+        pbRestoreQueue[i] = pbRestoreQueue[i] - PB_HT_REFUND_S
+    end
+    PB_Log("HT-REFUND", string.format("-%.1fs head=%.2f qLen=%d",
+        PB_HT_REFUND_S, pbRestoreQueue[1], #pbRestoreQueue))
+end
+
+-- Drain queue: pop every entry whose time has passed, increment pbCount.
+-- Called from UpdateBar's hot path so restored charges become visible
+-- within one frame of the predicted moment.
+local function PB_ProcessQueue(maxCharges)
+    local now = GetTime()
+    while #pbRestoreQueue > 0 and pbRestoreQueue[1] <= now do
+        table.remove(pbRestoreQueue, 1)
+        if pbCount ~= nil and pbCount < maxCharges then
+            local before = pbCount
+            pbCount = pbCount + 1
+            PB_Log("PB-INC", string.format("%s→%s (queue restore, qLen=%d)",
+                tostring(before), tostring(pbCount), #pbRestoreQueue))
+        end
+    end
+end
+
+-- Periodic state sampler. Compact TICK records: queue + booleans (which
+-- ARE readable). All numeric cooldown fields are secret-tagged in TWW 12.x
+-- so logging them is now pure waste — already verified.
+local function PB_PeriodicSample()
+    local now = GetTime()
+    if (now - pbLogLastSample) < 0.5 then return end
+    pbLogLastSample = now
+
+    local act = "?"
+    local cs = C_Spell and C_Spell.GetSpellCharges
+    if cs then
+        local info = cs(SPELL_PURIFYING_BREW)
+        if info then act = info.isActive and "t" or "f" end
+    end
+
+    local headIn = ""
+    if pbRestoreQueue[1] then
+        headIn = string.format(" head=%.1fs", pbRestoreQueue[1] - now)
+    end
+    PB_Log("TICK", string.format("cnt=%s qLen=%d act=%s%s",
+        tostring(pbCount), #pbRestoreQueue, act, headIn))
+end
+
 GetPurifyingBrewState = function()
-    local max, remaining = 2, nil  -- 2 is PB's known maxCharges
-    local current
+    local max = PB_DEFAULT_MAX_CHARGES
+    local remaining = nil
+    local now = GetTime()
 
-    -- Primary: GetSpellCount usually returns a plain integer count.
-    if GetSpellCount then
-        local c = GetSpellCount(SPELL_PURIFYING_BREW)
-        if type(c) == "number" and c >= 0 and c <= 10 then
-            current = c
+    -- Drain queue first — pop any restore times that have passed.
+    PB_ProcessQueue(max)
+
+    local cs = C_Spell and C_Spell.GetSpellCharges
+    if not cs then
+        return pbCount or max, max, remaining
+    end
+
+    local info = cs(SPELL_PURIFYING_BREW)
+    if not info then
+        if pbCount == nil then pbCount = max end
+        return pbCount, max, remaining
+    end
+
+    -- isActive (boolean) IS readable. Use it as the authoritative
+    -- "any charge on cooldown" signal. All numeric cooldown fields are
+    -- secret-tagged and unrecoverable in TWW 12.x.
+    local isActive = info.isActive and true or false
+
+    -- Race protection: API can lag ~1 frame after cast event. Inside the
+    -- 0.2s window, isActive=false is potentially stale and must NOT
+    -- trigger the reset that would overwrite our decrement and queue push.
+    if not isActive and (now - pbLastCastTime) > 0.2 then
+        if pbCount ~= max or #pbRestoreQueue > 0 then
+            PB_Log("RESET", string.format("pbCount %s→%d (qLen=%d→0)",
+                tostring(pbCount), max, #pbRestoreQueue))
+        end
+        pbCount = max
+        PB_ResetQueue()
+        -- Full-restore moment is the rare window where cooldownDuration
+        -- isn't secret-tagged. Refresh our cached haste-modified recharge.
+        PB_UpdateRechargeFromAPI()
+        return pbCount, max, remaining
+    end
+
+    if isActive then
+        -- First read with no prior state: best-guess max-1 (most common
+        -- "just cast once" case). Self-corrects on next cast or full restore.
+        if pbCount == nil then
+            pbCount = max - 1
+        end
+
+        -- Remaining time = head-of-queue minus now. Queue head = next
+        -- charge restore time (already tracks CDR adjustments).
+        if pbRestoreQueue[1] then
+            local r = pbRestoreQueue[1] - now
+            if r < 0 then r = 0 end
+            remaining = r
         end
     end
 
-    local cs = C_Spell and C_Spell.GetSpellCharges
-    if cs then
-        pcall(function()
-            local info = cs(SPELL_PURIFYING_BREW)
-            if not info then return end
-
-            local mx = tonumber(tostring(info.maxCharges or "")) or 2
-            max = mx
-
-            local isActive = info.isActive and true or false
-
-            -- If GetSpellCount didn't give us a plain count, derive from
-            -- the locally-tracked counter or fall back to the safest guess.
-            if current == nil then
-                if not isActive then
-                    current = mx  -- no cooldown → full charges
-                elseif pbTrackedCurrent ~= nil then
-                    current = pbTrackedCurrent
-                else
-                    current = 0  -- safe pessimistic default
-                end
-            end
-
-            -- Recharge timer (these fields ARE recoverable via tostring).
-            local st = tonumber(tostring(info.cooldownStartTime or "")) or 0
-            local du = tonumber(tostring(info.cooldownDuration or "")) or 0
-            if isActive and st > 0 and du > 0 then
-                local r = (st + du) - GetTime()
-                if r < 0 then r = 0 end
-                remaining = r
-            end
-        end)
-        if current == nil then current = 0 end
-        return current, max, remaining
-    end
-
-    -- Legacy fallback (older clients without C_Spell.GetSpellCharges)
-    if GetSpellCharges then
-        pcall(function()
-            local c, mx, st, du = GetSpellCharges(SPELL_PURIFYING_BREW)
-            c  = tonumber(tostring(c  or ""))
-            mx = tonumber(tostring(mx or ""))
-            st = tonumber(tostring(st or ""))
-            du = tonumber(tostring(du or ""))
-            if c then
-                current = c
-                max = mx or 0
-                if c < (mx or 0) and st and du then
-                    local r = (st + du) - GetTime()
-                    if r < 0 then r = 0 end
-                    remaining = r
-                end
-            end
-        end)
-        return current, max, remaining
-    end
-
-    return 0, 2, nil
+    if pbCount == nil then pbCount = max end
+    return pbCount, max, remaining
 end
 
 -- WHY: Unicode bullets ●○ (U+25CF/U+25CB) are not in FRIZQT__.TTF glyph set
@@ -583,13 +928,41 @@ FormatPBCharges = function(current, maxCharges, remaining)
 end
 
 -- Update bar
-function UpdateBar()
+UpdateBar = function()
     if not IsBrewmaster() then
         frame:Hide()
         return
     end
 
     local db = BrewmasterProDB
+
+    -- Shuffle drop alert: poll + transition log + one-shot sound.
+    -- WHY: расположено ВЫШЕ hideOOC/hideZeroStagger early-returns: алерт
+    -- о падении Shuffle нельзя пропустить из-за того что bar временно
+    -- скрыт UI-флагами (а игрок при этом в активном бою умирает).
+    do
+        local prevExpiresAt = shuffleExpiresAt
+        local d = C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID
+                and C_UnitAuras.GetPlayerAuraBySpellID(SPELL_SHUFFLE)
+        shuffleExpiresAt = d and d.expirationTime or 0
+
+        if shuffleExpiresAt > prevExpiresAt and shuffleExpiresAt > 0 then
+            shuffleAlertedThisDrop = false
+            if prevExpiresAt == 0 then
+                PB_Log("SHUFFLE-APPLY", string.format("dur=%.1fs", shuffleExpiresAt - GetTime()))
+            end
+        elseif prevExpiresAt > 0 and shuffleExpiresAt == 0 then
+            PB_Log("SHUFFLE-DROP", "")
+        end
+
+        if inCombat and shuffleExpiresAt == 0 and not shuffleAlertedThisDrop
+           and (GetTime() - lastShuffleRefreshCastTime) > SHUFFLE_RACE_S
+           and db.shuffleAlertEnabled and ns.TryPlaySelectedSound then
+            ns.TryPlaySelectedSound("shuffleAlertSoundIndex")
+            shuffleAlertedThisDrop = true
+        end
+    end
+
     local stagger
     if testMode then
         stagger = testStaggerValue or 0
@@ -599,8 +972,7 @@ function UpdateBar()
     local maxHP = UnitHealthMax("player") or 1
     local pct = stagger / maxHP
     local baseStagger = math.min(stagger, maxHP)
-    local overload = math.max(stagger - maxHP, 0)
-    local overloadPct = overload / maxHP
+    local overloadPct = math.max(stagger - maxHP, 0) / maxHP
 
     if db.hideOOC and not inCombat and not testMode then
         frame:Hide()
@@ -641,7 +1013,7 @@ function UpdateBar()
 
         local cooldown = 2.0
         if above and (not wasAboveAlert) and (now - lastAlertTime >= cooldown) then
-            BMP_TryPlaySelectedSound()
+            if ns.TryPlaySelectedSound then ns.TryPlaySelectedSound() end
             lastAlertTime = now
         end
 
@@ -666,33 +1038,31 @@ function UpdateBar()
 
     bar.tgtR, bar.tgtG, bar.tgtB = color[1], color[2], color[3]
 
-    -- Build text: pool / pct% [• X.X%/s] [• <PB icon> charges]
-    local mainText
+    -- Build text: pct% [• X.X%/s tick rate] [• <PB icon> charges]
+    -- WHY: pct already encodes overflow (e.g. 110% = pool 10% above max HP);
+    -- the overflowBar shows the same info visually, so raw numbers are redundant.
     if pct > 1 then
         overflowBar:SetValue(math.min(overloadPct, 1))
         overflowBar:SetStatusBarColor(1, 1, 1, 0.4)
         overflowBar:Show()
-        mainText = string.format("%s + %s / %.0f%%", FormatNumber(maxHP), FormatNumber(overload), pct * 100)
     else
         overflowBar:SetValue(0)
         overflowBar:Hide()
-        mainText = string.format("%s / %.0f%%", FormatNumber(stagger), pct * 100)
     end
 
+    local mainText = string.format("%.0f%%", pct * 100)
+
     if db.showTickRate and tickPctPerSec > 0 then
-        mainText = mainText .. string.format(" • %.1f%%/s", tickPctPerSec)
+        mainText = mainText .. string.format(" • %.1f%% HP/s", tickPctPerSec)
     end
 
     if db.showPBCharges and pbMax > 0 then
-        local dots = FormatPBCharges(pbCurrent, pbMax, pbRemaining)
-        if dots ~= "" then
-            mainText = mainText .. " • " .. dots
-        end
+        mainText = mainText .. " • " .. FormatPBCharges(pbCurrent, pbMax, pbRemaining)
     end
 
     text:SetText(mainText)
-    BrewmasterProLastText = mainText
-    BrewmasterProLastStagger = stagger
+    diagLastText = mainText
+    diagLastStagger = stagger
 
     -- Flash logic: critical (Heavy + 0 charges) overrides normal flash with red.
     -- WHY: communicates "purify is on cooldown — switch to Celestial/Fortifying"
@@ -720,17 +1090,28 @@ frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+-- WHY: detect talent changes and re-probe which CDR-affecting talents
+-- the player has selected. Fires on respec / talent loadout switch.
+frame:RegisterEvent("PLAYER_TALENT_UPDATE")
+-- WHY: talent loadout API may not be ready until TRAIT_CONFIG_UPDATED;
+-- listen to both for safety. The handler is idempotent.
+frame:RegisterEvent("TRAIT_CONFIG_UPDATED")
 frame:RegisterUnitEvent("UNIT_HEALTH", "player")
 frame:RegisterUnitEvent("UNIT_MAXHEALTH", "player")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
 frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 -- WHY: PB charge changes need instant UI refresh so the smart-alert gate and
--- charge dots reflect reality the moment the player presses or recharges.
+-- charge text reflect reality the moment the player presses or recharges.
 -- SPELL_UPDATE_COOLDOWN fires for every spell — too noisy. The 20Hz OnUpdate
 -- below smoothly ticks the recharge timer between charge events.
 frame:RegisterEvent("SPELL_UPDATE_CHARGES")
--- WHY: needed for the event-driven charge counter fallback when the API
--- only gives us secret values for currentCharges.
+-- WHY: combat log → detect "large hits" on player → triggers High Tolerance
+-- talent's "Elevated Stagger" condition. Without this we miss the refund
+-- in non-Heavy-Stagger combats.
+frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+-- WHY: authoritative cast trigger for the manual pbCount decrement. Required
+-- because secret-value protection hides the live currentCharges field, so
+-- the only way to detect "charge consumed" is to observe the cast itself.
 frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 
 frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
@@ -769,34 +1150,159 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
 
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_SPECIALIZATION_CHANGED" then
         inCombat = InCombatLockdown() and true or false
+        -- Probe talents and live recharge time on world-enter / spec change.
+        -- Both APIs may be unstable in the first second of login, but the
+        -- TALENT_UPDATE / TRAIT_CONFIG_UPDATED handlers will re-probe later.
+        PB_DetectTalents()
+        PB_UpdateRechargeFromAPI()
         UpdateBar()
+
+    elseif event == "PLAYER_TALENT_UPDATE" or event == "TRAIT_CONFIG_UPDATED" then
+        PB_DetectTalents()
+
+    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        -- Only care if HT talented — otherwise skip combat log work entirely.
+        if hasHighTolerance then
+            -- Combat log args: [1]=timestamp, [2]=subevent, [3..11]=base
+            -- (hideCaster, src/dest GUID/name/flags), then prefix-specific.
+            -- SWING_*: [12]=amount. SPELL/RANGE/SPELL_PERIODIC_*: [12]=spellID,
+            -- [13]=name, [14]=school, [15]=amount.
+            local args = { CombatLogGetCurrentEventInfo() }
+            local subevent = args[2]
+            local destGUID = args[8]
+            if destGUID == UnitGUID("player")
+                and (subevent == "SWING_DAMAGE" or subevent == "SPELL_DAMAGE"
+                     or subevent == "RANGE_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE") then
+                local dmg = (subevent == "SWING_DAMAGE") and args[12] or args[15]
+                local maxHP = UnitHealthMax("player") or 0
+                if dmg and maxHP > 0 and (dmg / maxHP) >= PB_HT_HIT_THRESHOLD_FRAC then
+                    pbLastHeavyHitTime = GetTime()
+                end
+            end
+        end
 
     elseif event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH" then
         UpdateBar()
 
     elseif event == "SPELL_UPDATE_CHARGES" then
+        -- arg1 may carry spellID in modern retail (parameterless on legacy
+        -- clients). Log the raw value to find out empirically.
+        PB_Log("UPD", "spellID=" .. tostring(arg1))
+        -- Cheap opportunity to refresh haste-modified base recharge: if PB
+        -- just hit a state where isActive=false (full restore), this is
+        -- the only window where info.cooldownDuration isn't secret.
+        PB_UpdateRechargeFromAPI()
         if frame:IsShown() then
             UpdateBar()
         end
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         -- arg1=unit, arg2=castGUID, arg3=spellID
-        if arg1 == "player" and arg3 == SPELL_PURIFYING_BREW then
-            -- Decrement the locally-tracked counter; UpdateBar's pcall path
-            -- uses this when GetSpellCount/secret-value reads don't deliver
-            -- a usable plain integer.
-            if pbTrackedCurrent == nil then pbTrackedCurrent = 2 end
-            pbTrackedCurrent = pbTrackedCurrent - 1
-            if pbTrackedCurrent < 0 then pbTrackedCurrent = 0 end
-            if frame:IsShown() then UpdateBar() end
+        if arg1 == "player" then
+            -- Log every player cast — gives /brewdbg the timeline of what
+            -- the user actually pressed during combat.
+            PB_Log("CAST", spellLabel(arg3))
+
+            if arg3 == SPELL_PURIFYING_BREW then
+                pbLastCastTime = GetTime()
+                local max = PB_DEFAULT_MAX_CHARGES
+                if pbCount == nil then pbCount = max end
+                -- Self-correcting: WoW only fires UNIT_SPELLCAST_SUCCEEDED
+                -- for casts that actually went through. If pbCount==0 here,
+                -- a charge MUST have been available we missed (silent restore
+                -- via secret-tagged API). Bump to 1 BEFORE decrementing.
+                local before = pbCount
+                if pbCount == 0 then
+                    pbCount = 1
+                    PB_Log("SELF-CORR", string.format("0→1 before DEC (missed restore)"))
+                    -- Pop the corresponding queue entry — the charge we just
+                    -- "discovered" was already restored, so it shouldn't fire
+                    -- a second time later.
+                    if pbRestoreQueue[1] then
+                        table.remove(pbRestoreQueue, 1)
+                    end
+                end
+                pbCount = pbCount - 1
+                if pbCount < 0 then pbCount = 0 end
+                PB_Log("PB-DEC", string.format("%s→%s", tostring(before), tostring(pbCount)))
+                PB_QueueRestore()
+                -- High Tolerance: refund part of the cooldown if we're in
+                -- Elevated Stagger. Apply AFTER the queue push so the just-
+                -- pushed entry can also receive the refund.
+                if hasHighTolerance and PB_IsElevatedStagger() then
+                    PB_ApplyHTRefund()
+                end
+                if frame:IsShown() then UpdateBar() end
+
+            elseif arg3 == SPELL_TIGER_PALM then
+                PB_ApplyCDR(PB_CDR_TIGER_PALM_S, "TigerPalm")
+                -- Tiger Palm consumes Blackout Combo buff (for damage; no
+                -- PB CDR bonus on this path — only KS-consumption gives
+                -- bonus CDR).
+                if pbBoCActive then
+                    pbBoCActive = false
+                    PB_Log("BOC-CONSUME", "TP (no CDR bonus)")
+                end
+                if frame:IsShown() then UpdateBar() end
+
+            elseif arg3 == SPELL_KEG_SMASH then
+                local cdr = PB_CDR_KEG_SMASH_S
+                local source = "KegSmash"
+                if pbBoCActive and hasBlackoutCombo then
+                    -- BoC consumed by KS gives +2s extra (5s total).
+                    -- Meditative Focus (Hero talent) increases this further;
+                    -- in-game tooltip is the source of truth for the bumped
+                    -- value but isn't documented numerically. Best estimate
+                    -- from Wowhead notes: +1s on top → 6s total. If user
+                    -- reports persistent over-prediction with MF talented,
+                    -- tune PB_CDR_KEG_SMASH_BOC_BONUS_MF below.
+                    cdr = cdr + PB_CDR_KEG_SMASH_BOC_BONUS
+                    if hasMeditativeFocus then cdr = cdr + 1.0 end
+                    source = hasMeditativeFocus and "KegSmash+BoC+MF" or "KegSmash+BoC"
+                    pbBoCActive = false
+                end
+                PB_ApplyCDR(cdr, source)
+                lastShuffleRefreshCastTime = GetTime()  -- KS refreshes Shuffle (race-window for drop alert)
+                if frame:IsShown() then UpdateBar() end
+
+            elseif arg3 == SPELL_BLACKOUT_KICK then
+                -- Blackout Kick generates the Blackout Combo buff IF the
+                -- player has the talent. Each new BoK overwrites the buff
+                -- (no stacking). The buff is consumed by the NEXT Tiger
+                -- Palm or Keg Smash. Without the talent, BoK is just a
+                -- damage ability — no PB interaction.
+                if hasBlackoutCombo then
+                    if not pbBoCActive then PB_Log("BOC-GAIN", "") end
+                    pbBoCActive = true
+                end
+                -- BoK refreshes Shuffle вне зависимости от Blackout Combo талента
+                -- (это базовая механика спека). Штамп ставим всегда.
+                lastShuffleRefreshCastTime = GetTime()
+
+            elseif arg3 == SPELL_BLACK_OX_BREW then
+                -- Black Ox Brew: instant full PB reset (resets all charges)
+                pbCount = PB_DEFAULT_MAX_CHARGES
+                PB_ResetQueue()
+                PB_Log("BOB-RESET", string.format("pbCount→%d", pbCount))
+                if frame:IsShown() then UpdateBar() end
+            end
         end
 
     elseif event == "PLAYER_REGEN_DISABLED" then
         inCombat = true
+        -- Re-arm Shuffle drop alert на каждый вход в бой. Без этого: если
+        -- Shuffle упал в прошлом бою → латч взведён → новый бой без баффа
+        -- → нет алерта (предупреждения о критическом состоянии нет).
+        shuffleAlertedThisDrop = false
+        PB_Log("COMBAT", "enter")
         UpdateBar()
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         inCombat = false
+        -- Buff state from Blackout Combo doesn't persist OOC for long;
+        -- clear our model to avoid stale-buff drift on next combat.
+        pbBoCActive = false
+        PB_Log("COMBAT", "exit")
         UpdateBar()
     end
 end)
@@ -817,18 +1323,21 @@ ticker:SetScript("OnUpdate", function(_, delta)
     elapsed = elapsed + delta
     if elapsed >= 0.05 then
         elapsed = 0
-        BrewmasterProTickerCount = (BrewmasterProTickerCount or 0) + 1
+        diagTickerCount = diagTickerCount + 1
         if IsPlayerInWorld() then
             -- WHY: pcall surfaces silent UpdateBar errors when /console scriptErrors 0
-            -- is set (the common default). BrewmasterProLastError / ErrorCount let
+            -- is set (the common default). diagLastError / diagErrorCount let
             -- /brewdbg point straight at the failing line.
             local ok, err = pcall(UpdateBar)
             if ok then
-                BrewmasterProSuccessCount = (BrewmasterProSuccessCount or 0) + 1
+                diagSuccessCount = diagSuccessCount + 1
             else
-                BrewmasterProErrorCount = (BrewmasterProErrorCount or 0) + 1
-                BrewmasterProLastError = err
+                diagErrorCount = diagErrorCount + 1
+                diagLastError = err
             end
+            -- Periodic state sample for /brewdbg log. pcall isolated so a
+            -- bad sample can't break the ticker.
+            pcall(PB_PeriodicSample)
         end
     end
 end)
@@ -879,7 +1388,7 @@ local function StopStaggerBarTest()
     UpdateBar()
 end
 
-function ToggleStaggerBarTest()
+ToggleStaggerBarTest = function()
     if testMode then
         StopStaggerBarTest()
     else
@@ -887,7 +1396,11 @@ function ToggleStaggerBarTest()
     end
 end
 
-
+-- WHY: cross-file API for Options. Main file loads first per .toc order, so
+-- Options can read these directly off ns at script-load time.
+ns.UpdateBar = UpdateBar
+ns.ApplySettings = ApplySettings
+ns.ToggleStaggerBarTest = ToggleStaggerBarTest
 
 -- ============================================================================
 -- Slash command
@@ -899,7 +1412,17 @@ SLASH_BREWMASTERPRO2 = "/brewmasterpro"
 -- Dumps every input UpdateBar relies on so we can pinpoint which API
 -- regressed in a given client patch.
 SLASH_BREWMASTERPRODBG1 = "/brewdbg"
-SlashCmdList["BREWMASTERPRODBG"] = function()
+SlashCmdList["BREWMASTERPRODBG"] = function(msg)
+    local cmd = (msg or ""):lower():match("^%s*(%S*)") or ""
+
+    if cmd == "clear" then
+        pbEventLog = {}
+        pbLogStartTime = 0
+        pbLogLastSample = 0
+        print("|cff00ff00BrewmasterPro:|r combat log cleared.")
+        return
+    end
+
     local cls = select(2, UnitClass("player")) or "?"
     local spec = GetSpecialization() or -1
     local rawStagger = UnitStagger and UnitStagger("player")
@@ -920,34 +1443,143 @@ SlashCmdList["BREWMASTERPRODBG"] = function()
         print("  Active stagger aura: none")
     end
     if pbInfo then
-        local cur = tonumber(tostring(pbInfo.currentCharges)) or -1
-        local mx  = tonumber(tostring(pbInfo.maxCharges)) or -1
-        print(string.format("  PB charges: %d/%d  (cdStart=%s, cdDur=%s, isActive=%s)",
-            cur, mx,
-            tostring(pbInfo.cooldownStartTime), tostring(pbInfo.cooldownDuration),
+        -- All numeric cooldown fields are secret-tagged in TWW 12.x. Print
+        -- the readable booleans + restore queue state. The numeric fields
+        -- would just show "secret value" tokens if we tried.
+        print(string.format("  PB API booleans: isActive=%s",
             tostring(pbInfo.isActive)))
     else
         print("  PB charges: C_Spell.GetSpellCharges returned nil")
     end
-    if GetSpellCount then
-        local c = GetSpellCount(SPELL_PURIFYING_BREW)
-        print(string.format("  GetSpellCount: %s (type=%s)", tostring(c), type(c)))
-    end
-    print(string.format("  pbTrackedCurrent: %s", tostring(pbTrackedCurrent)))
+    print(string.format("  PB queue: len=%d%s base=%.3fs BoC=%s",
+        #pbRestoreQueue,
+        pbRestoreQueue[1] and string.format(", head in %.1fs", pbRestoreQueue[1] - GetTime()) or "",
+        pbCachedRecharge,
+        tostring(pbBoCActive)))
+    print(string.format("  Talents: BoC=%s PtA=%s LB=%s MF=%s HT=%s",
+        tostring(hasBlackoutCombo), tostring(hasPressAdvantage),
+        tostring(hasLightBrewing), tostring(hasMeditativeFocus),
+        tostring(hasHighTolerance)))
+    -- Live derivation: what GetPurifyingBrewState reports to UpdateBar.
+    local liveCur, liveMax, liveRem = GetPurifyingBrewState()
+    local now = GetTime()
+    print(string.format("  PB live tracker: %s/%s  (rem=%s, pbCount=%s, qLen=%d)",
+        tostring(liveCur), tostring(liveMax),
+        liveRem and string.format("%.1fs", liveRem) or "nil",
+        tostring(pbCount), #pbRestoreQueue))
+    print(string.format("  pbLastCastTime: %s (%.1fs ago)",
+        tostring(pbLastCastTime),
+        pbLastCastTime > 0 and (now - pbLastCastTime) or 0))
+    print(string.format("  Shuffle: rem=%.1fs, alertLatch=%s, lastRefresh=%.1fs ago",
+        math.max(0, shuffleExpiresAt - now),
+        tostring(shuffleAlertedThisDrop),
+        lastShuffleRefreshCastTime > 0 and (now - lastShuffleRefreshCastTime) or 0))
     print(string.format("  Frame shown: %s, ticker exists: %s, ticker calls: %s, in combat: %s",
         tostring(BrewmasterProFrame and BrewmasterProFrame:IsShown()),
-        tostring(_G.BrewmasterProTicker ~= nil),
-        tostring(BrewmasterProTickerCount or 0),
+        tostring(ticker ~= nil),
+        tostring(diagTickerCount),
         tostring(InCombatLockdown())))
     print(string.format("  testMode: %s, testStaggerValue: %s",
         tostring(testMode), tostring(testStaggerValue)))
-    print(string.format("  Last UpdateBar stagger: %s", tostring(BrewmasterProLastStagger)))
-    print(string.format("  Last UpdateBar text: %s", tostring(BrewmasterProLastText)))
+    print(string.format("  Last UpdateBar stagger: %s", tostring(diagLastStagger)))
+    print(string.format("  Last UpdateBar text: %s", tostring(diagLastText)))
     print(string.format("  UpdateBar success/error: %s / %s",
-        tostring(BrewmasterProSuccessCount or 0),
-        tostring(BrewmasterProErrorCount or 0)))
-    if BrewmasterProLastError then
-        print(string.format("  |cffff5555Last error:|r %s", tostring(BrewmasterProLastError)))
+        tostring(diagSuccessCount), tostring(diagErrorCount)))
+    if diagLastError then
+        print(string.format("  |cffff5555Last error:|r %s", tostring(diagLastError)))
+    end
+
+    -- Combat event log dump — every cast / charge update / periodic sample
+    -- since /brewdbg clear (or session start). Capped at PB_LOG_MAX entries.
+    print(string.format("|cff00ff00Combat log|r (%d entries, oldest first):", #pbEventLog))
+    if #pbEventLog == 0 then
+        print("  (empty — log will populate during combat / casts / ticks)")
+    else
+        for _, e in ipairs(pbEventLog) do
+            print(string.format("  [%6.2fs] %-7s %s", e.t, e.ev, e.p))
+        end
+    end
+
+    -- WHY: chat is in-memory only and visible chat is limited to ~30 lines —
+    -- with 300 log entries most scroll off and aren't recoverable. Persist
+    -- everything to SavedVariables so a /reload flushes it to disk and the
+    -- AI can read the full snapshot from BrewmasterPro.lua. NOT cleared on
+    -- /reload (separate from runtime pbEventLog) so it survives until next
+    -- /brewdbg overwrite or /brewdbg clear.
+    if BrewmasterProDB then
+        local snap = {
+            timestamp = date("%Y-%m-%d %H:%M:%S"),
+            class = cls,
+            spec = spec,
+            isBrewmaster = IsBrewmaster(),
+            unitStaggerRaw = rawStagger,
+            getStaggerAmount = computed,
+            maxHP = maxHP,
+            staggerPct = maxHP > 0 and (computed / maxHP * 100) or 0,
+            inCombat = InCombatLockdown(),
+            testMode = testMode,
+            -- Tracker state
+            pbCount = pbCount,
+            pbQueueLen = #pbRestoreQueue,
+            pbQueueHead = pbRestoreQueue[1],
+            pbLastCastTime = pbLastCastTime,
+            pbCachedRecharge = pbCachedRecharge,
+            pbBoCActive = pbBoCActive,
+            -- Shuffle drop alert state (Phase 1)
+            shuffleExpiresAt = shuffleExpiresAt,
+            shuffleRem = math.max(0, shuffleExpiresAt - GetTime()),
+            shuffleAlertedThisDrop = shuffleAlertedThisDrop,
+            lastShuffleRefreshCastTime = lastShuffleRefreshCastTime,
+            -- Detected talents
+            hasBlackoutCombo = hasBlackoutCombo,
+            hasPressAdvantage = hasPressAdvantage,
+            hasLightBrewing = hasLightBrewing,
+            hasMeditativeFocus = hasMeditativeFocus,
+            hasHighTolerance = hasHighTolerance,
+            -- Diagnostics
+            diagSuccessCount = diagSuccessCount,
+            diagErrorCount = diagErrorCount,
+            diagLastError = diagLastError,
+            diagLastText = diagLastText,
+            diagLastStagger = diagLastStagger,
+            diagTickerCount = diagTickerCount,
+        }
+        -- API-readable booleans only — all numeric cooldown fields are
+        -- secret-tagged in TWW 12.x and unrecoverable, so logging them
+        -- is pure noise (will write nil --[[secret value]] always).
+        if pbInfo then
+            snap.rawIsActive = tostring(pbInfo.isActive)
+        end
+        local cd = C_Spell and C_Spell.GetSpellCooldown
+        if cd then
+            local cdInfo = cd(SPELL_PURIFYING_BREW)
+            if cdInfo then
+                snap.cdEnabled = tostring(cdInfo.isEnabled)
+            end
+        end
+        if aura then
+            snap.staggerAura = {
+                spellId = aura.spellId,
+                duration = aura.duration,
+                applications = aura.applications,
+                points1 = aura.points and aura.points[1] or nil,
+            }
+        end
+        -- Deep copy event log (raw pbEventLog reference would mutate after dump)
+        local logCopy = {}
+        for i, e in ipairs(pbEventLog) do
+            logCopy[i] = { t = e.t, ev = e.ev, p = e.p }
+        end
+        snap.eventLog = logCopy
+        BrewmasterProDB.lastDebugDump = snap
+        print("|cff00ff00Saved to SavedVariables.|r Run /reload to flush BrewmasterPro.lua to disk.")
+    end
+
+    -- Screenshot — saved to World of Warcraft/_retail_/Screenshots/
+    -- so user can attach it alongside the chat log when reporting.
+    if Screenshot then
+        Screenshot()
+        print("|cff00ff00Screenshot saved|r to _retail_/Screenshots/")
     end
 end
 
@@ -955,23 +1587,20 @@ SlashCmdList["BREWMASTERPRO"] = function(msg)
     local cmd = (msg or ""):lower():match("^%s*(%S*)") or ""
 
     if cmd == "" then
-        if not BrewmasterProOptions then
-            local opt = CreateMonkStaggerOptionsWindow()
-            opt:Show()
-            return
-        end
-
-        if BrewmasterProOptions:IsShown() then
+        if BrewmasterProOptions and BrewmasterProOptions:IsShown() then
             BrewmasterProOptions:Hide()
         else
-            BrewmasterProOptions:Show()
+            -- CreateMonkStaggerOptionsWindow handles both first-create
+            -- (frame is shown by default) and already-exists (early-returns
+            -- after Show()) cases.
+            CreateMonkStaggerOptionsWindow()
         end
 
     elseif cmd == "sound" then
-        BMP_TryPlaySelectedSound()
+        if ns.TryPlaySelectedSound then ns.TryPlaySelectedSound() end
 
     else
-        print("|cff00ff00" .. (title or addonName) .. ":|r /brew to open options (or /brew sound to test)")
+        print("|cff00ff00" .. (title or addonName) .. ":|r /brew options, /brew sound test, /brewdbg diagnostics+log+screenshot, /brewdbg clear")
     end
 end
 

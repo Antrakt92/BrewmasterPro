@@ -7,10 +7,15 @@ local addonName, ns = ...
 local title = C_AddOns and C_AddOns.GetAddOnMetadata(addonName, "Title") or GetAddOnMetadata(addonName, "Title")
 local version = C_AddOns and C_AddOns.GetAddOnMetadata(addonName, "Version") or GetAddOnMetadata(addonName, "Version")
 local Clamp = ns.Clamp
+-- WHY: bridge to functions defined in BrewmasterPro.lua (which loads first
+-- per .toc). Avoids polluting _G with generic names like UpdateBar.
+local UpdateBar = ns.UpdateBar
+local ApplySettings = ns.ApplySettings
+local ToggleStaggerBarTest = ns.ToggleStaggerBarTest
 
 local UI = {
     WINDOW_W = 640,
-    WINDOW_H = 380,
+    WINDOW_H = 460,
     LEFT_PANE_W = 150,
     TITLE_BAR_H = 30,
 
@@ -67,6 +72,10 @@ local UI = {
         SOUND_THRESHOLD = -190,
         SMART_ALERT = -220,
         SOUND_ROW = -252,
+        -- Phase 1 Shuffle drop alert (Phase 2 будет полный визуальный tracker)
+        SHUFFLE_SEPARATOR = -290,
+        SHUFFLE_ALERT     = -306,
+        SHUFFLE_SOUND_ROW = -338,
     },
 }
 
@@ -117,9 +126,14 @@ local function BMP_BuildSoundDropdownItems()
     return items
 end
 
-local function BMP_GetCurrentSoundLabel()
+-- WHY: optional soundKey позволяет разным алертам (PB stagger, Shuffle drop,
+-- будущие Phase 3+ трекеры) держать НЕЗАВИСИМЫЕ выборы звука. Default
+-- "alertSoundIndex" сохраняет backwards-compat для всех существующих call
+-- site'ов БЕЗ аргумента (PB alert, /brew sound test, Test button в Options).
+local function BMP_GetCurrentSoundLabel(soundKey)
+    soundKey = soundKey or "alertSoundIndex"
     local sounds = ns.addonSounds or {}
-    local idx = BrewmasterProDB and BrewmasterProDB.alertSoundIndex or 1
+    local idx = BrewmasterProDB and BrewmasterProDB[soundKey] or 1
     local soundData = sounds[idx]
 
     if type(soundData) == "table" then
@@ -131,20 +145,23 @@ local function BMP_GetCurrentSoundLabel()
     return "Unknown"
 end
 
-function BMP_GetSelectedAddonSound(db)
+local function BMP_GetSelectedAddonSound(db, soundKey)
+    soundKey = soundKey or "alertSoundIndex"
     local sounds = ns.addonSounds or {}
-    local idx = tonumber(db.alertSoundIndex) or 1
+    local idx = tonumber(db[soundKey]) or 1
     idx = Clamp(idx, 1, math.max(#sounds, 1))
-    db.alertSoundIndex = idx
+    db[soundKey] = idx
     return sounds[idx], idx
 end
 
-function BMP_TryPlaySelectedSound()
+-- WHY: exposed via `ns` (not as a global BMP_*) so the main file can call it
+-- through the addon namespace without polluting _G.
+function ns.TryPlaySelectedSound(soundKey)
     local db = BrewmasterProDB
     local sounds = ns.addonSounds or {}
     if not db or #sounds == 0 then return end
 
-    local s = BMP_GetSelectedAddonSound(db)
+    local s = BMP_GetSelectedAddonSound(db, soundKey)
     if s and s.path then
         PlaySoundFile(s.path, "Master")
     end
@@ -1216,9 +1233,42 @@ function CreateMonkStaggerOptionsWindow()
         reg(function() soundDD:SetSelectedValue(db.alertSoundIndex) end)
 
         local testBtn = BMP_CreateButton(s, "Test Sound", 80, 22, function()
-            BMP_TryPlaySelectedSound()
+            ns.TryPlaySelectedSound()
         end)
         testBtn:SetPoint("LEFT", soundDD, "RIGHT", UI.BUTTON_GAP, 0)
+
+        -- Phase 1: Shuffle drop alert (sound only, no visual tracker until Phase 2)
+        local shuffleSep = s:CreateTexture(nil, "ARTWORK")
+        shuffleSep:SetColorTexture(0.30, 0.85, 0.55, 0.7)
+        shuffleSep:SetPoint("TOPLEFT",  s, "TOPLEFT",   UI.SEPARATOR_INSET, UI.ALERTS_Y.SHUFFLE_SEPARATOR)
+        shuffleSep:SetPoint("TOPRIGHT", s, "TOPRIGHT", -UI.SEPARATOR_INSET, UI.ALERTS_Y.SHUFFLE_SEPARATOR)
+        shuffleSep:SetHeight(1)
+
+        local cbShuffle = BMP_CreateCheckbox(s, "Alert sound when Shuffle drops in combat", db.shuffleAlertEnabled, function(_, checked)
+            db.shuffleAlertEnabled = checked
+        end)
+        cbShuffle:SetPoint("TOPLEFT", s, "TOPLEFT", UI.SECTION_LEFT, UI.ALERTS_Y.SHUFFLE_ALERT)
+        reg(function() cbShuffle:SetCheckedState(db.shuffleAlertEnabled) end)
+
+        local shuffleSoundLabel = BMP_CreateLabel(s, "Drop sound", 12)
+        shuffleSoundLabel:SetPoint("TOPLEFT", s, "TOPLEFT", UI.SECTION_LEFT, UI.ALERTS_Y.SHUFFLE_SOUND_ROW)
+
+        local shuffleSoundDD = BMP_CreateDropdown(
+            s,
+            UI.SOUND_DROPDOWN_WIDTH,
+            BMP_GetCurrentSoundLabel("shuffleAlertSoundIndex"),
+            BMP_BuildSoundDropdownItems(),
+            function(value, label)
+                db.shuffleAlertSoundIndex = value
+            end
+        )
+        shuffleSoundDD:SetPoint("LEFT", shuffleSoundLabel, "LEFT", UI.FIELD_X, 0)
+        reg(function() shuffleSoundDD:SetSelectedValue(db.shuffleAlertSoundIndex) end)
+
+        local shuffleTestBtn = BMP_CreateButton(s, "Test", 60, 22, function()
+            ns.TryPlaySelectedSound("shuffleAlertSoundIndex")
+        end)
+        shuffleTestBtn:SetPoint("LEFT", shuffleSoundDD, "RIGHT", UI.BUTTON_GAP, 0)
     end
 
     f.reset = BMP_CreateButton(f, "Reset", 90, 24, function()
