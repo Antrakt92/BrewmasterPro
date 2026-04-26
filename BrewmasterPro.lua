@@ -606,14 +606,6 @@ local shuffleExpiresAt = 0
 local shuffleAlertedThisDrop = false
 local lastShuffleRefreshCastTime = 0
 
--- Diagnostic: walk all HELPFUL auras periodically + direct GetPlayerAuraBySpellID
--- result to verify whether 215479 is the right spellID in current player context.
--- Throttled to 1 walk / 2s in poll-block so /brewdbg dump captures whatever
--- buff state is current. Field-by-field separate entries so taint of one
--- doesn't nuke the others on serialization.
-local shuffleDiagSnap = nil
-local shuffleDiagLastWalk = 0
-
 
 -- ============================================================================
 -- Combat event log (ring buffer, in-memory, dumped via /brewdbg)
@@ -982,39 +974,6 @@ UpdateBar = function()
             ns.TryPlaySelectedSound("shuffleAlertSoundIndex")
             shuffleAlertedThisDrop = true
         end
-
-        -- DIAGNOSTIC walk: 1 per 2s. Captures direct lookup result + any
-        -- HELPFUL aura whose name contains "Shuffle" with its spellID. If
-        -- 215479 is the wrong ID for current player context, the walk will
-        -- show what spellID actually carries the visible buff.
-        local nowT = GetTime()
-        if (nowT - shuffleDiagLastWalk) >= 2.0 and C_UnitAuras then
-            shuffleDiagLastWalk = nowT
-            local snap = {
-                t = nowT,
-                inCombat = inCombat,
-                directHit = d and true or false,
-                directName = d and d.name or nil,
-                directSpellId = d and d.spellId or nil,
-                directExpires = d and d.expirationTime or nil,
-                directDuration = d and d.duration or nil,
-                walkMatches = {},
-            }
-            local getByIdx = C_UnitAuras.GetAuraDataByIndex
-            if getByIdx then
-                for i = 1, 40 do
-                    local a = getByIdx("player", i, "HELPFUL")
-                    if not a then break end
-                    if a.name and string.find(a.name, "Shuffle") then
-                        snap.walkMatches[#snap.walkMatches + 1] = {
-                            idx = i, name = a.name, spellId = a.spellId,
-                            duration = a.duration, expires = a.expirationTime,
-                        }
-                    end
-                end
-            end
-            shuffleDiagSnap = snap
-        end
     end
 
     local stagger
@@ -1159,14 +1118,16 @@ frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 -- SPELL_UPDATE_COOLDOWN fires for every spell — too noisy. The 20Hz OnUpdate
 -- below smoothly ticks the recharge timer between charge events.
 frame:RegisterEvent("SPELL_UPDATE_CHARGES")
--- WHY: combat log → detect "large hits" on player → triggers High Tolerance
--- talent's "Elevated Stagger" condition. Without this we miss the refund
--- in non-Heavy-Stagger combats.
-frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+-- WHY: COMBAT_LOG_EVENT_UNFILTERED registration is FORBIDDEN from the addon
+-- main chunk in TWW 12.0.5 (ADDON_ACTION_FORBIDDEN). The event must be
+-- registered later, after PLAYER_LOGIN — see deferred RegisterEvent in the
+-- PLAYER_LOGIN handler below. Used by HT (High Tolerance) heavy-hit detection.
 -- WHY: authoritative cast trigger for the manual pbCount decrement. Required
 -- because secret-value protection hides the live currentCharges field, so
 -- the only way to detect "charge consumed" is to observe the cast itself.
 frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
+-- Deferred-registration latch for COMBAT_LOG_EVENT_UNFILTERED.
+local cleuRegistered = false
 
 frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" and arg1 == addonName then
@@ -1204,6 +1165,13 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
 
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_SPECIALIZATION_CHANGED" then
         inCombat = InCombatLockdown() and true or false
+        -- Defer COMBAT_LOG_EVENT_UNFILTERED registration to here — the
+        -- main-chunk path is forbidden in TWW 12.0.5 (ADDON_ACTION_FORBIDDEN).
+        -- One-time latch via cleuRegistered.
+        if not cleuRegistered then
+            frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+            cleuRegistered = true
+        end
         -- Probe talents and live recharge time on world-enter / spec change.
         -- Both APIs may be unstable in the first second of login, but the
         -- TALENT_UPDATE / TRAIT_CONFIG_UPDATED handlers will re-probe later.
@@ -1533,17 +1501,6 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
         math.max(0, shuffleExpiresAt - now),
         tostring(shuffleAlertedThisDrop),
         lastShuffleRefreshCastTime > 0 and (now - lastShuffleRefreshCastTime) or 0))
-    if shuffleDiagSnap then
-        print(string.format("  Shuffle diag: directHit=%s, directName=%s, directSpellId=%s, walkMatches=%d",
-            tostring(shuffleDiagSnap.directHit),
-            tostring(shuffleDiagSnap.directName),
-            tostring(shuffleDiagSnap.directSpellId),
-            #shuffleDiagSnap.walkMatches))
-        for _, m in ipairs(shuffleDiagSnap.walkMatches) do
-            print(string.format("    walk[%d]: name=%s spellId=%s dur=%s",
-                m.idx, tostring(m.name), tostring(m.spellId), tostring(m.duration)))
-        end
-    end
     print(string.format("  Frame shown: %s, ticker exists: %s, ticker calls: %s, in combat: %s",
         tostring(BrewmasterProFrame and BrewmasterProFrame:IsShown()),
         tostring(ticker ~= nil),
@@ -1600,7 +1557,6 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
             shuffleRem = math.max(0, shuffleExpiresAt - GetTime()),
             shuffleAlertedThisDrop = shuffleAlertedThisDrop,
             lastShuffleRefreshCastTime = lastShuffleRefreshCastTime,
-            shuffleDiagSnap = shuffleDiagSnap,
             -- Detected talents
             hasBlackoutCombo = hasBlackoutCombo,
             hasPressAdvantage = hasPressAdvantage,
