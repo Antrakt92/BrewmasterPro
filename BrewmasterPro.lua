@@ -606,6 +606,15 @@ local shuffleExpiresAt = 0
 local shuffleAlertedThisDrop = false
 local lastShuffleRefreshCastTime = 0
 
+-- Diagnostic aura snapshot: captured every UpdateBar tick (untainted addon
+-- code path), then READ by /brewdbg without re-walking. WHY this indirection:
+-- in TWW 12.0.5, slash-command execution is tainted by ForceTaint_Strong,
+-- and `aura.name` field returns a SECRET STRING in that context — accessing
+-- it errors with "attempt to index field 'name' (a secret string value)".
+-- Walking auras inside the slash handler aborts the entire dump. Capturing
+-- in addon-event code (this file's UpdateBar / OnEvent) avoids the taint.
+local diagPlayerAuras = {}
+
 -- ============================================================================
 -- Combat event log (ring buffer, in-memory, dumped via /brewdbg)
 -- ============================================================================
@@ -972,6 +981,27 @@ UpdateBar = function()
            and db.shuffleAlertEnabled and ns.TryPlaySelectedSound then
             ns.TryPlaySelectedSound("shuffleAlertSoundIndex")
             shuffleAlertedThisDrop = true
+        end
+
+        -- Diagnostic aura capture: walk all helpful auras and stash to
+        -- module-local. Read by /brewdbg without re-walking. Safe here —
+        -- UpdateBar runs in untainted addon-code path, so a.name doesn't
+        -- return secret string (unlike chat-issued slash commands).
+        if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
+            local list = {}
+            for i = 1, 40 do
+                local a = C_UnitAuras.GetAuraDataByIndex("player", i, "HELPFUL")
+                if not a then break end
+                list[#list+1] = {
+                    i = i,
+                    name = a.name,
+                    spellId = a.spellId,
+                    duration = a.duration,
+                    remaining = a.expirationTime and (a.expirationTime - GetTime()) or 0,
+                    applications = a.applications,
+                }
+            end
+            diagPlayerAuras = list
         end
     end
 
@@ -1582,26 +1612,11 @@ SlashCmdList["BREWMASTERPRODBG"] = function(msg)
                 points1 = aura.points and aura.points[1] or nil,
             }
         end
-        -- Diagnostic: dump ALL helpful auras on the player so we can find
-        -- Shuffle's actual aura spellID without depending on chat output or
-        -- locale-dependent name matching. Cheap (one-shot at /brewdbg time).
-        if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
-            local list = {}
-            for i = 1, 40 do
-                local a = C_UnitAuras.GetAuraDataByIndex("player", i, "HELPFUL")
-                if a and a.name then
-                    list[#list+1] = {
-                        i = i,
-                        name = a.name,
-                        spellId = a.spellId,
-                        duration = a.duration,
-                        remaining = a.expirationTime and (a.expirationTime - GetTime()) or 0,
-                        applications = a.applications,
-                    }
-                end
-            end
-            snap.playerHelpfulAuras = list
-        end
+        -- Diagnostic: read pre-captured aura list. WHY captured in UpdateBar
+        -- not here: TWW 12.0.5 taints slash commands with ForceTaint_Strong,
+        -- making `a.name` return secret strings → indexing aborts the dump.
+        -- diagPlayerAuras is updated in UpdateBar (untainted) every tick.
+        snap.playerHelpfulAuras = diagPlayerAuras
         -- Deep copy event log (raw pbEventLog reference would mutate after dump)
         local logCopy = {}
         for i, e in ipairs(pbEventLog) do
