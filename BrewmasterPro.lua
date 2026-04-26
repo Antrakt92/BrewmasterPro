@@ -480,8 +480,10 @@ end
 -- stagger debuff's `duration` field works regardless of which talent is on.
 GetStaggerDuration = function()
     local data = GetActiveStaggerAura()
-    if data and data.duration and data.duration > 0 then
-        return data.duration
+    -- CleanNumber: data.duration is secret-tagged in combat, taints on `> 0`.
+    local duration = data and CleanNumber(data.duration)
+    if duration and duration > 0 then
+        return duration
     end
     return STAGGER_DEFAULT_DURATION
 end
