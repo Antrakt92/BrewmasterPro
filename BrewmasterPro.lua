@@ -97,6 +97,18 @@ local function Clamp(n, minv, maxv)
 end
 ns.Clamp = Clamp
 
+-- WHY: in TWW 12.x retail, many stat-reading APIs (UnitStagger, UnitHealthMax,
+-- aura .expirationTime mid-combat, etc.) return SECRET-TAGGED NUMBERS. Direct
+-- arithmetic or comparison on them (e.g. `s > 0`) STICKILY TAINTS the entire
+-- addon for the rest of the session — after which `C_UnitAuras.GetPlayerAuraBySpellID`
+-- returns nil for all the player's own buffs, breaking aura trackers silently.
+-- Filter every stat read through this gate before doing arithmetic on it.
+local issecretvalue = _G.issecretvalue or function() return false end
+local function CleanNumber(v)
+    if v == nil or issecretvalue(v) then return nil end
+    return v
+end
+
 local function FormatNumber(num)
     if num >= 1000000 then
         return string.format("%.1fM", num / 1000000)
@@ -480,22 +492,22 @@ end
 -- count gives total remaining pool. Aura.applications also encodes total
 -- pool on some clients, so we use whichever is non-zero.
 GetStaggerAmount = function()
-    local s = UnitStagger and UnitStagger("player")
+    -- WHY CleanNumber: UnitStagger("player") returns secret-tagged number in
+    -- combat in TWW 12.x. Direct comparison `s > 0` taints addon → kills aura API.
+    local s = UnitStagger and CleanNumber(UnitStagger("player"))
     if s and s > 0 then return s end
 
     local data = GetActiveStaggerAura()
     if data then
-        -- points[1] = damage per 0.5s tick; total ticks = duration / 0.5
-        if data.points and data.points[1] and data.duration and data.duration > 0 then
-            local perTick = data.points[1]
-            local ticks = data.duration / 0.5
+        local perTick = data.points and CleanNumber(data.points[1])
+        local duration = CleanNumber(data.duration)
+        if perTick and duration and duration > 0 then
+            local ticks = duration / 0.5
             local pool = perTick * ticks
             if pool > 0 then return pool end
         end
-        -- Fallback to applications if it carries a non-trivial value
-        if data.applications and data.applications > 1 then
-            return data.applications
-        end
+        local apps = CleanNumber(data.applications)
+        if apps and apps > 1 then return apps end
     end
     return s or 0
 end
@@ -920,7 +932,10 @@ UpdateBar = function()
         local prevExpiresAt = shuffleExpiresAt
         local d = C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID
                 and C_UnitAuras.GetPlayerAuraBySpellID(SPELL_SHUFFLE)
-        shuffleExpiresAt = d and d.expirationTime or 0
+        -- CleanNumber: aura.expirationTime can be secret-tagged in combat.
+        -- Comparing it (`shuffleExpiresAt > prevExpiresAt`) on a secret value
+        -- would taint addon and silently kill subsequent aura API calls.
+        shuffleExpiresAt = (d and CleanNumber(d.expirationTime)) or 0
 
         if shuffleExpiresAt > prevExpiresAt and shuffleExpiresAt > 0 then
             shuffleAlertedThisDrop = false
@@ -945,7 +960,11 @@ UpdateBar = function()
     else
         stagger = GetStaggerAmount()
     end
-    local maxHP = UnitHealthMax("player") or 1
+    -- CleanNumber gate: UnitHealthMax can be secret-tagged in combat. Direct
+    -- arithmetic (`stagger / maxHP`) on secret-tagged maxHP would taint addon
+    -- and silently kill aura API for the rest of session.
+    local maxHP = CleanNumber(UnitHealthMax("player")) or 1
+    if maxHP < 1 then maxHP = 1 end
     local pct = stagger / maxHP
     local baseStagger = math.min(stagger, maxHP)
     local overloadPct = math.max(stagger - maxHP, 0) / maxHP
