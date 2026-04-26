@@ -1118,16 +1118,17 @@ frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 -- SPELL_UPDATE_COOLDOWN fires for every spell — too noisy. The 20Hz OnUpdate
 -- below smoothly ticks the recharge timer between charge events.
 frame:RegisterEvent("SPELL_UPDATE_CHARGES")
--- WHY: COMBAT_LOG_EVENT_UNFILTERED registration is FORBIDDEN from the addon
--- main chunk in TWW 12.0.5 (ADDON_ACTION_FORBIDDEN). The event must be
--- registered later, after PLAYER_LOGIN — see deferred RegisterEvent in the
--- PLAYER_LOGIN handler below. Used by HT (High Tolerance) heavy-hit detection.
+-- WHY no COMBAT_LOG_EVENT_UNFILTERED: in TWW 12.0.5 RegisterEvent for CLEU
+-- fires ADDON_ACTION_FORBIDDEN both from main chunk AND from any deferred
+-- handler (PLAYER_LOGIN, PLAYER_ENTERING_WORLD) — Blizzard added a hard
+-- protection on this specific event for our context. CLEU was used only
+-- by HT (High Tolerance) heavy-hit detection (pbLastHeavyHitTime). Without
+-- it, PB_IsElevatedStagger() degrades to the Heavy Stagger debuff aura
+-- check only — minor accuracy loss, no visible regression for the user.
 -- WHY: authoritative cast trigger for the manual pbCount decrement. Required
 -- because secret-value protection hides the live currentCharges field, so
 -- the only way to detect "charge consumed" is to observe the cast itself.
 frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
--- Deferred-registration latch for COMBAT_LOG_EVENT_UNFILTERED.
-local cleuRegistered = false
 
 frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" and arg1 == addonName then
@@ -1165,13 +1166,6 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
 
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_SPECIALIZATION_CHANGED" then
         inCombat = InCombatLockdown() and true or false
-        -- Defer COMBAT_LOG_EVENT_UNFILTERED registration to here — the
-        -- main-chunk path is forbidden in TWW 12.0.5 (ADDON_ACTION_FORBIDDEN).
-        -- One-time latch via cleuRegistered.
-        if not cleuRegistered then
-            frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-            cleuRegistered = true
-        end
         -- Probe talents and live recharge time on world-enter / spec change.
         -- Both APIs may be unstable in the first second of login, but the
         -- TALENT_UPDATE / TRAIT_CONFIG_UPDATED handlers will re-probe later.
@@ -1181,27 +1175,6 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
 
     elseif event == "PLAYER_TALENT_UPDATE" or event == "TRAIT_CONFIG_UPDATED" then
         PB_DetectTalents()
-
-    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        -- Only care if HT talented — otherwise skip combat log work entirely.
-        if hasHighTolerance then
-            -- Combat log args: [1]=timestamp, [2]=subevent, [3..11]=base
-            -- (hideCaster, src/dest GUID/name/flags), then prefix-specific.
-            -- SWING_*: [12]=amount. SPELL/RANGE/SPELL_PERIODIC_*: [12]=spellID,
-            -- [13]=name, [14]=school, [15]=amount.
-            local args = { CombatLogGetCurrentEventInfo() }
-            local subevent = args[2]
-            local destGUID = args[8]
-            if destGUID == UnitGUID("player")
-                and (subevent == "SWING_DAMAGE" or subevent == "SPELL_DAMAGE"
-                     or subevent == "RANGE_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE") then
-                local dmg = (subevent == "SWING_DAMAGE") and args[12] or args[15]
-                local maxHP = UnitHealthMax("player") or 0
-                if dmg and maxHP > 0 and (dmg / maxHP) >= PB_HT_HIT_THRESHOLD_FRAC then
-                    pbLastHeavyHitTime = GetTime()
-                end
-            end
-        end
 
     elseif event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH" then
         UpdateBar()
