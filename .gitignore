@@ -16,8 +16,8 @@ desktop.ini
 *.lua.bak
 SavedVariables/
 
-# Dev-internal docs — must NOT leak into the public repo. AI workflow notes,
-# audit backlogs, planning sketches, anything ad-hoc with "private" in the name.
+# Dev-internal docs — must NOT leak into the public repo. AUDIT lives in
+# WOW/brewmasterpro-meta/ (private repo); any local notes / planning sketches stay private.
 AUDIT.md
 PLAN.md
 NOTES.md
