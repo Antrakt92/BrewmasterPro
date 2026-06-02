@@ -16,8 +16,8 @@ desktop.ini
 *.lua.bak
 SavedVariables/
 
-# Dev-internal docs — must NOT leak into the public repo. AUDIT lives in
-# WOW/brewmasterpro-meta/ (private repo); any local notes / planning sketches stay private.
+# Developer-only local notes and private planning files.
+AGENTS.md
 AUDIT.md
 PLAN.md
 NOTES.md
